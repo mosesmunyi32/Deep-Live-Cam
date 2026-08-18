@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deep-Live-Cam — live</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --line: #2a313c;
+    --fg: #e6edf3; --muted: #8b949e; --accent: #2f81f7; --bad: #f85149; --ok: #3fb950;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif;
+    padding: 24px;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; font-weight: 600; }
+  .sub { color: var(--muted); margin-bottom: 20px; }
+  .controls {
+    display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 14px; margin-bottom: 16px;
+  }
+  button, input, select {
+    background: #0d1117; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 7px 12px; font: inherit;
+  }
+  button { cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .stage { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+  figure { margin: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  figcaption { padding: 8px 12px; color: var(--muted); border-bottom: 1px solid var(--line); }
+  video, img#out { width: 100%; display: block; background: #000; aspect-ratio: 4/3; object-fit: contain; }
+  #status { margin-top: 14px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  #status.err { color: var(--bad); }
+  #status.ok { color: var(--ok); }
+  label { color: var(--muted); }
+</style>
+</head>
+<body>
+
+<h1>Deep-Live-Cam — live stream</h1>
+<div class="sub">Frames are sent to the GPU pod over a WebSocket and returned swapped.</div>
+
+<div class="controls">
+  <label>Source face <input type="file" id="srcFile" accept="image/*"></label>
+  <label>FPS cap
+    <select id="fps">
+      <option value="10">10</option>
+      <option value="15" selected>15</option>
+      <option value="20">20</option>
+      <option value="30">30</option>
+    </select>
+  </label>
+  <label>Width
+    <select id="width">
+      <option value="480">480</option>
+      <option value="640" selected>640</option>
+      <option value="960">960</option>
+    </select>
+  </label>
+  <button id="start" class="primary">Start</button>
+  <button id="stop" disabled>Stop</button>
+</div>
+
+<div class="stage">
+  <figure><figcaption>Camera</figcaption><video id="cam" autoplay playsinline muted></video></figure>
+  <figure><figcaption>Swapped</figcaption><img id="out" alt="swapped output"></figure>
+</div>
+
+<div id="status">Idle.</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const statusEl = $("status");
+const token = new URLSearchParams(location.search).get("token") || "";
+
+let ws = null, stream = null, running = false;
+let inFlight = false, sourceReady = false;
+let frames = 0, lastTick = performance.now(), lastLatency = 0, sentAt = 0;
+const canvas = document.createElement("canvas");
+const ctx = canvas.getContext("2d", { willReadFrequently: false });
+
+function setStatus(msg, cls = "") {
+  statusEl.textContent = msg;
+  statusEl.className = cls;
+}
+
+function wsUrl() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  return `${proto}//${location.host}/ws${token ? "?token=" + encodeURIComponent(token) : ""}`;
+}
+
+$("srcFile").addEventListener("change", async (ev) => {
+  const file = ev.target.files[0];
+  if (!file) return;
+  const b64 = await new Promise((res) => {
+    const r = new FileReader();
+    r.onload = () => res(r.result);
+    r.readAsDataURL(file);
+  });
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "source", data: b64 }));
+    setStatus("Uploading source face…");
+  } else {
+    sessionStorage.setItem("pendingSource", b64);
+    setStatus("Source staged — press Start.");
+  }
+});
+
+$("start").addEventListener("click", async () => {
+  try {
+    const width = parseInt($("width").value, 10);
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: width }, height: { ideal: Math.round(width * 3 / 4) } },
+      audio: false,
+    });
+  } catch (err) {
+    setStatus("Camera access denied: " + err.message, "err");
+    return;
+  }
+  $("cam").srcObject = stream;
+
+  ws = new WebSocket(wsUrl());
+  ws.binaryType = "arraybuffer";
+
+  ws.onopen = () => {
+    running = true;
+    $("start").disabled = true;
+    $("stop").disabled = false;
+    setStatus("Connected. Waiting for a source face…", "ok");
+    const staged = sessionStorage.getItem("pendingSource");
+    if (staged) {
+      ws.send(JSON.stringify({ type: "source", data: staged }));
+      sessionStorage.removeItem("pendingSource");
+    }
+    pump();
+  };
+
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === "string") {
+      const body = JSON.parse(ev.data);
+      if (body.type === "error") setStatus("Error: " + body.message, "err");
+      else {
+        if (body.message === "source face set") sourceReady = true;
+        setStatus(body.message, "ok");
+      }
+      return;
+    }
+    // Binary: a swapped frame.
+    lastLatency = performance.now() - sentAt;
+    inFlight = false;
+    frames++;
+    const blob = new Blob([ev.data], { type: "image/jpeg" });
+    const url = URL.createObjectURL(blob);
+    const img = $("out");
+    const prev = img.src;
+    img.src = url;
+    if (prev.startsWith("blob:")) URL.revokeObjectURL(prev);
+  };
+
+  ws.onclose = () => { setStatus("Disconnected.", "err"); teardown(); };
+  ws.onerror = () => setStatus("WebSocket error — check the token and the pod logs.", "err");
+});
+
+$("stop").addEventListener("click", teardown);
+
+function teardown() {
+  running = false;
+  if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  $("start").disabled = false;
+  $("stop").disabled = true;
+}
+
+function pump() {
+  const video = $("cam");
+  const interval = 1000 / parseInt($("fps").value, 10);
+  let last = 0;
+
+  function tick(now) {
+    if (!running) return;
+    requestAnimationFrame(tick);
+
+    // Only one frame in flight at a time. This paces the sender to whatever the
+    // GPU can actually keep up with, instead of queueing frames in the socket.
+    if (inFlight || !sourceReady) return;
+    if (now - last < interval) return;
+    if (!video.videoWidth) return;
+    last = now;
+
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    ctx.drawImage(video, 0, 0);
+    canvas.toBlob((blob) => {
+      if (!blob || !running || ws.readyState !== WebSocket.OPEN) return;
+      blob.arrayBuffer().then((buf) => {
+        inFlight = true;
+        sentAt = performance.now();
+        ws.send(buf);
+      });
+    }, "image/jpeg", 0.8);
+  }
+  requestAnimationFrame(tick);
+
+  setInterval(() => {
+    if (!running) return;
+    const dt = (performance.now() - lastTick) / 1000;
+    const fps = (frames / dt).toFixed(1);
+    frames = 0; lastTick = performance.now();
+    setStatus(`Streaming — ${fps} fps · round-trip ${lastLatency.toFixed(0)} ms`, "ok");
+  }, 1000);
+}
+</script>
+</body>
+</html>

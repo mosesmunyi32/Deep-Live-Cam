@@ -1,0 +1,29 @@
+# Server-side dependency set for the streaming deployment.
+#
+# Mirrors the upstream requirements.txt with two deliberate omissions:
+#   - PySide6         : desktop GUI only; the server stubs modules.ui instead.
+#   - opencv-python   : the GUI build. opencv-python-headless replaces it and
+#                       avoids pulling X11/GTK into the image.
+#   - pygrabber       : Windows-only camera enumeration.
+#
+# torch is intentionally absent. Every torch import in modules/ is guarded, and
+# without it the swapper selects the fp32 inswapper model (see deploy/README.md).
+
+numpy>=2.0,<3
+typing-extensions>=4.15.0
+opencv-python-headless==4.14.0.94
+onnx==1.22.0
+insightface==0.7.3
+psutil==7.2.2
+pillow==12.3.0
+tqdm>=4.66.3
+onnxruntime-gpu==1.26.0
+protobuf>=6.33.5,<8
+
+# NSFW screening of uploaded source faces. Pulls TensorFlow (~1 GB); drop these
+# two lines and set DLC_NSFW_FILTER=0 if you want a leaner image.
+opennsfw2==0.18.0
+keras>=3.0.0
+
+# Streaming server.
+aiohttp>=3.10,<4

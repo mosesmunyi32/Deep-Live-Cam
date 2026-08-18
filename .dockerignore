@@ -1,0 +1,11 @@
+.git
+.github
+media
+tests
+locales
+*.bat
+benchmark_pipeline.py
+models/*.onnx
+models/*.pth
+**/__pycache__
+*.pyc
