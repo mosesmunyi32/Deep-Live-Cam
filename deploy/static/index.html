@@ -2,142 +2,206 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0e1116">
 <title>Deep-Live-Cam — live</title>
 <style>
   :root {
     --bg: #0e1116; --panel: #161b22; --line: #2a313c;
     --fg: #e6edf3; --muted: #8b949e; --accent: #2f81f7; --bad: #f85149; --ok: #3fb950;
+    --tap: 44px;   /* minimum comfortable touch target */
   }
   * { box-sizing: border-box; }
+  html, body { margin: 0; }
   body {
-    margin: 0; background: var(--bg); color: var(--fg);
-    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif;
-    padding: 24px;
+    background: var(--bg); color: var(--fg);
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif;
+    padding: 16px calc(16px + env(safe-area-inset-right)) calc(16px + env(safe-area-inset-bottom)) calc(16px + env(safe-area-inset-left));
+    max-width: 1100px; margin: 0 auto;
+    -webkit-text-size-adjust: 100%;
   }
-  h1 { font-size: 18px; margin: 0 0 4px; font-weight: 600; }
-  .sub { color: var(--muted); margin-bottom: 20px; }
-  .controls {
-    display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
-    background: var(--panel); border: 1px solid var(--line);
-    border-radius: 8px; padding: 14px; margin-bottom: 16px;
-  }
-  button, input, select {
-    background: #0d1117; color: var(--fg); border: 1px solid var(--line);
-    border-radius: 6px; padding: 7px 12px; font: inherit;
-  }
-  button { cursor: pointer; }
-  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-  button:disabled { opacity: .5; cursor: not-allowed; }
-  .stage { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
-  figure { margin: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
-  figcaption { padding: 8px 12px; color: var(--muted); border-bottom: 1px solid var(--line); }
+  h1 { font-size: 17px; margin: 0 0 2px; font-weight: 600; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 14px; }
+
+  /* --- video stage: side by side on desktop, stacked on phone --- */
+  .stage { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
+  figure { margin: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  figcaption { padding: 7px 11px; color: var(--muted); font-size: 12px; border-bottom: 1px solid var(--line); }
   video, img#out { width: 100%; display: block; background: #000; aspect-ratio: 4/3; object-fit: contain; }
-  #status { margin-top: 14px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  /* --- primary bar stays visible; everything else collapses --- */
+  .primary-bar {
+    position: sticky; bottom: 0; z-index: 5;
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 10px; margin-bottom: 12px;
+  }
+  #status { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 13px; flex: 1 1 100%; }
   #status.err { color: var(--bad); }
   #status.ok { color: var(--ok); }
-  label { color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
-  .mono { font-family: ui-monospace, monospace; color: var(--fg); }
-  .hint { color: var(--muted); font-size: 12px; flex: 1 1 260px; }
+
+  details {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; margin-bottom: 10px; overflow: hidden;
+  }
+  summary {
+    padding: 12px 14px; cursor: pointer; font-weight: 600; font-size: 14px;
+    list-style: none; display: flex; align-items: center; gap: 8px;
+    min-height: var(--tap);
+  }
+  summary::-webkit-details-marker { display: none; }
+  summary::after { content: "▸"; margin-left: auto; color: var(--muted); transition: transform .15s; }
+  details[open] > summary::after { transform: rotate(90deg); }
+  details[open] > summary { border-bottom: 1px solid var(--line); }
+  summary em { font-weight: 400; font-style: normal; color: var(--muted); font-size: 12px; }
+  .body { padding: 12px 14px; display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+
+  button, input, select {
+    background: #0d1117; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 8px; padding: 9px 12px; font: inherit; min-height: var(--tap);
+  }
+  button { cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  label { color: var(--muted); display: inline-flex; align-items: center; gap: 8px; font-size: 14px; }
+  label b { color: var(--fg); font-weight: 600; }
+  input[type=range] { accent-color: var(--accent); min-height: 0; padding: 0; flex: 1 1 130px; }
+  input[type=checkbox], input[type=radio] { accent-color: var(--accent); min-height: 0; width: 20px; height: 20px; }
+  input[type=file] { padding: 7px; max-width: 100%; }
+  .mono { font-family: ui-monospace, monospace; color: var(--fg); min-width: 3ch; }
+  .hint { color: var(--muted); font-size: 12px; flex: 1 1 240px; }
   .hint b { color: var(--fg); }
-  input[type=range] { accent-color: var(--accent); }
-  input[type=checkbox] { accent-color: var(--accent); }
-  .rowlabel { color: var(--fg); font-weight: 600; flex-basis: 100%; }
+  .rowlabel { color: var(--fg); font-weight: 600; flex-basis: 100%; font-size: 13px; }
   .rowlabel em { color: var(--muted); font-weight: 400; font-style: normal; font-size: 12px; }
-  .camctl { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; color: var(--muted); }
-  .faces { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-start; color: var(--muted); }
-  .face { position: relative; border: 2px solid var(--line); border-radius: 8px; padding: 0; cursor: pointer; background: #0d1117; line-height: 0; }
+  .camctl { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; color: var(--muted); flex: 1 1 100%; }
+
+  .faces { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-start; color: var(--muted); flex: 1 1 100%; }
+  .face { position: relative; border: 2px solid var(--line); border-radius: 10px; cursor: pointer; background: #0d1117; line-height: 0; }
   .face.active { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(47,129,247,.3); }
-  .face img { width: 72px; height: 72px; object-fit: cover; border-radius: 6px; display: block; }
-  .face .idx { position: absolute; top: 2px; left: 4px; font: 11px ui-monospace, monospace; color: #fff; text-shadow: 0 0 3px #000; }
-  .face .del { position: absolute; top: -6px; right: -6px; background: var(--bad); color: #fff; border: none; border-radius: 50%; width: 18px; height: 18px; font-size: 11px; line-height: 1; cursor: pointer; padding: 0; }
+  .face img { width: 76px; height: 76px; object-fit: cover; border-radius: 8px; display: block; }
+  .face .idx { position: absolute; top: 3px; left: 5px; font: 11px ui-monospace, monospace; color: #fff; text-shadow: 0 0 3px #000; }
+  .face .del {
+    position: absolute; top: -8px; right: -8px; background: var(--bad); color: #fff;
+    border: none; border-radius: 50%; width: 26px; height: 26px; min-height: 0;
+    font-size: 14px; line-height: 1; cursor: pointer; padding: 0;
+  }
+
+  @media (max-width: 720px) {
+    body { padding: 12px 12px calc(12px + env(safe-area-inset-bottom)); font-size: 16px; }
+    .stage { grid-template-columns: 1fr; }
+    /* One control per line: side-by-side sliders are unusable at thumb width. */
+    .body > label, .body > button, .body > .hint { flex: 1 1 100%; }
+    .body > label { justify-content: space-between; }
+    input[type=range] { flex: 1 1 auto; }
+    select, input[type=file] { max-width: 60%; }
+    .primary-bar button { flex: 1 1 0; }
+  }
 </style>
 </head>
 <body>
 
-<h1>Deep-Live-Cam — live stream</h1>
-<div class="sub">Frames are sent to the GPU pod over a WebSocket and returned swapped.</div>
-
-<div class="controls">
-  <label>Add face(s) <input type="file" id="srcFile" accept="image/*" multiple></label>
-  <label>Camera
-    <select id="camera"><option value="">default</option></select>
-  </label>
-  <button id="refreshCams" title="Re-scan for cameras">⟳</button>
-  <label>FPS cap
-    <select id="fps">
-      <option value="10">10</option>
-      <option value="15" selected>15</option>
-      <option value="20">20</option>
-      <option value="30">30</option>
-    </select>
-  </label>
-  <label>Width
-    <select id="width">
-      <option value="480">480</option>
-      <option value="640" selected>640</option>
-      <option value="960">960</option>
-    </select>
-  </label>
-  <button id="start" class="primary" disabled>Start</button>
-  <button id="stop" disabled>Stop</button>
-</div>
-
-<div class="controls">
-  <label>Model
-    <select id="model"><option value="fp32">loading…</option></select>
-  </label>
-  <label>Opacity
-    <input type="range" id="opacity" min="0" max="1" step="0.05" value="1">
-    <span id="opacityVal" class="mono">1.00</span>
-  </label>
-  <label>Sharpness
-    <input type="range" id="sharpness" min="0" max="1" step="0.05" value="0">
-    <span id="sharpnessVal" class="mono">0.00</span>
-  </label>
-  <label><input type="checkbox" id="manyFaces"> All faces</label>
-  <label><input type="checkbox" id="mouthMask" title="Keep the real mouth from your footage"> Keep real mouth</label>
-  <label><input type="checkbox" id="poissonBlend" title="Seamless edge blending — better join, costs ~10-30ms per frame"> Seamless edges <em style="color:var(--muted)">(slower)</em></label>
-  <label><input type="checkbox" id="enableInterpolation" title="Blend with the previous frame to reduce flicker"> Smooth over time</label>
-</div>
-
-<div class="controls">
-  <span class="rowlabel">Mode</span>
-  <label><input type="radio" name="mode" id="modeSwap" value="swap" checked> <b>Face swap</b> — keeps <em>your</em> hair and head</label>
-  <label><input type="radio" name="mode" id="modePortrait" value="portrait"> <b>Portrait</b> — uses the <em>chosen image's</em> hair and head</label>
-  <span id="modeHint" class="hint"></span>
-</div>
-
-<div class="controls">
-  <span class="rowlabel">Face library <em>(click to switch instantly — number keys 1-9 also work)</em></span>
-  <div id="faces" class="faces">No faces yet — add one or more images above.</div>
-</div>
-
-<div class="controls">
-  <span class="rowlabel">Lighting <em>(server-side, always available)</em></span>
-  <label>Brightness <input type="range" id="brightness" min="-100" max="100" step="1" value="0"><span id="brightnessVal" class="mono">0</span></label>
-  <label>Contrast <input type="range" id="contrast" min="0.2" max="3" step="0.05" value="1"><span id="contrastVal" class="mono">1.00</span></label>
-  <label>Saturation <input type="range" id="saturation" min="0" max="3" step="0.05" value="1"><span id="saturationVal" class="mono">1.00</span></label>
-  <button id="resetAdjust">Reset</button>
-</div>
-
-<div class="controls" id="camControlsRow">
-  <span class="rowlabel">Camera controls <em>(native, device-dependent)</em></span>
-  <div id="camControls" class="camctl">Start the camera to see what it supports.</div>
-</div>
-
-<div class="controls">
-  <button id="popout">Open output window</button>
-  <button id="copyObs">Copy OBS browser-source URL</button>
-  <span id="obsHint" class="hint">OBS → Sources → + → <b>Browser</b> → paste URL, 960×540, uncheck "Shutdown source when not visible".</span>
-</div>
+<h1>Deep-Live-Cam</h1>
+<div class="sub">Frames go to the GPU and come back swapped.</div>
 
 <div class="stage">
   <figure><figcaption>Camera</figcaption><video id="cam" autoplay playsinline muted></video></figure>
-  <figure><figcaption>Swapped</figcaption><img id="out" alt="swapped output"></figure>
+  <figure><figcaption>Output</figcaption><img id="out" alt="swapped output"></figure>
 </div>
 
-<div id="status">Connecting…</div>
+<div class="primary-bar">
+  <button id="start" class="primary" disabled>Start</button>
+  <button id="stop" disabled>Stop</button>
+  <div id="status">Connecting…</div>
+</div>
+
+<details open>
+  <summary>Faces <em>— tap to switch, or keys 1-9</em></summary>
+  <div class="body">
+    <label>Add face(s) <input type="file" id="srcFile" accept="image/*" multiple></label>
+    <div id="faces" class="faces">No faces yet — add one or more images above.</div>
+  </div>
+</details>
+
+<details>
+  <summary>Mode <em>— whose hair appears</em></summary>
+  <div class="body">
+    <label><input type="radio" name="mode" id="modeSwap" value="swap" checked> <b>Face swap</b> — keeps <em>your</em> hair</label>
+    <label><input type="radio" name="mode" id="modePortrait" value="portrait"> <b>Portrait</b> — uses the <em>image's</em> hair</label>
+    <span id="modeHint" class="hint"></span>
+  </div>
+</details>
+
+<details>
+  <summary>Camera <em>— device, resolution, frame rate</em></summary>
+  <div class="body">
+    <label>Camera
+      <select id="camera"><option value="">default</option></select>
+    </label>
+    <button id="refreshCams" title="Re-scan for cameras">⟳ Re-scan</button>
+    <label>FPS cap
+      <select id="fps">
+        <option value="10">10</option>
+        <option value="15" selected>15</option>
+        <option value="20">20</option>
+        <option value="30">30</option>
+      </select>
+    </label>
+    <label>Width
+      <select id="width">
+        <option value="480">480</option>
+        <option value="640" selected>640</option>
+        <option value="960">960</option>
+      </select>
+    </label>
+  </div>
+</details>
+
+<details>
+  <summary>Model &amp; blending</summary>
+  <div class="body">
+    <label>Model
+      <select id="model"><option value="fp32">loading…</option></select>
+    </label>
+    <label>Opacity
+      <input type="range" id="opacity" min="0" max="1" step="0.05" value="1">
+      <span id="opacityVal" class="mono">1.00</span>
+    </label>
+    <label>Sharpness
+      <input type="range" id="sharpness" min="0" max="1" step="0.05" value="0">
+      <span id="sharpnessVal" class="mono">0.00</span>
+    </label>
+    <label><input type="checkbox" id="manyFaces"> All faces</label>
+    <label><input type="checkbox" id="mouthMask" title="Keep the real mouth from your footage"> Keep real mouth</label>
+    <label><input type="checkbox" id="poissonBlend" title="Seamless edge blending — costs ~10-30ms per frame"> Seamless edges <em>(slower)</em></label>
+    <label><input type="checkbox" id="enableInterpolation" title="Blend with the previous frame to reduce flicker"> Smooth over time</label>
+  </div>
+</details>
+
+<details>
+  <summary>Lighting <em>— server-side, works on any device</em></summary>
+  <div class="body">
+    <label>Brightness <input type="range" id="brightness" min="-100" max="100" step="1" value="0"><span id="brightnessVal" class="mono">0</span></label>
+    <label>Contrast <input type="range" id="contrast" min="0.2" max="3" step="0.05" value="1"><span id="contrastVal" class="mono">1.00</span></label>
+    <label>Saturation <input type="range" id="saturation" min="0" max="3" step="0.05" value="1"><span id="saturationVal" class="mono">1.00</span></label>
+    <button id="resetAdjust">Reset</button>
+  </div>
+</details>
+
+<details id="camControlsRow">
+  <summary>Camera controls <em>— native, device-dependent</em></summary>
+  <div class="body">
+    <div id="camControls" class="camctl">Start the camera to see what it supports.</div>
+  </div>
+</details>
+
+<details>
+  <summary>Output window &amp; OBS</summary>
+  <div class="body">
+    <button id="popout">Open output window</button>
+    <button id="copyObs">Copy OBS browser-source URL</button>
+    <span id="obsHint" class="hint">OBS → Sources → + → <b>Browser</b> → paste URL, 960×540, uncheck "Shutdown source when not visible".</span>
+  </div>
+</details>
 
 <script>
 const $ = (id) => document.getElementById(id);
