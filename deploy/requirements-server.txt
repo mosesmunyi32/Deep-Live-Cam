@@ -2,8 +2,6 @@
 #
 # Mirrors the upstream requirements.txt with two deliberate omissions:
 #   - PySide6         : desktop GUI only; the server stubs modules.ui instead.
-#   - opencv-python   : the GUI build. opencv-python-headless replaces it and
-#                       avoids pulling X11/GTK into the image.
 #   - pygrabber       : Windows-only camera enumeration.
 #
 # torch is intentionally absent. Every torch import in modules/ is guarded, and
@@ -11,6 +9,12 @@
 
 numpy>=2.0,<3
 typing-extensions>=4.15.0
+# Both OpenCV distributions, pinned to the same version, exactly as upstream does.
+# insightface and opennsfw2 both hard-require opencv-python, so dropping it does
+# not keep it out of the image - it just lets pip resolve it to a different major
+# (5.x) alongside headless 4.x. Two packages then provide `cv2` at different
+# versions and whichever installs last wins. Same version on both is the fix.
+opencv-python==4.14.0.94
 opencv-python-headless==4.14.0.94
 onnx==1.22.0
 insightface==0.7.3
@@ -20,10 +24,19 @@ tqdm>=4.66.3
 onnxruntime-gpu==1.26.0
 protobuf>=6.33.5,<8
 
-# NSFW screening of uploaded source faces. Pulls TensorFlow (~1 GB); drop these
-# two lines and set DLC_NSFW_FILTER=0 if you want a leaner image.
+# NSFW screening of uploaded source faces.
+#
+# opennsfw2 declares keras only as an optional extra and names no backend at all,
+# so a plain install yields keras with nothing under it and `import keras` raises
+# ModuleNotFoundError: tensorflow. is_nsfw() fails closed, which would reject
+# every uploaded source face. tensorflow-cpu supplies the backend; CPU is the
+# right choice because this runs once per session on a single still image and
+# has no business competing with onnxruntime for VRAM.
+#
+# Drop these three lines and set DLC_NSFW_FILTER=0 for a leaner image.
 opennsfw2==0.18.0
 keras>=3.0.0
+tensorflow-cpu>=2.16
 
 # Streaming server.
 aiohttp>=3.10,<4
