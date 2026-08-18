@@ -107,30 +107,12 @@ by adding torch — see the fp16 measurement under GPU sizing first.
 
 ## Deploy
 
-The image lives in a private ghcr package, so Runpod needs a credential before
-it can pull. Register it once — a GitHub PAT with **`read:packages`** as the
-password, your GitHub username as the username:
-
-```bash
-runpodctl registry create \
-  --name ghcr-deep-live-cam \
-  --username <github-user> \
-  --password <PAT with read:packages>
-
-runpodctl registry list          # note the returned id
-```
-
-Run that in your own shell, not through an agent — the PAT is a secret and a
-command line ends up in shell history. Only the returned id is needed
-afterwards.
-
-Then create the pod:
+The package is public, so no registry credential is required:
 
 ```bash
 runpodctl pod create \
   --name deep-live-cam \
   --image ghcr.io/<owner>/deep-live-cam-stream:latest \
-  --registry-auth-id <id-from-registry-list> \
   --gpu-id "NVIDIA A40" \
   --gpu-count 1 \
   --container-disk-in-gb 40 \
@@ -139,10 +121,16 @@ runpodctl pod create \
   --wait
 ```
 
+If you make the package private later, register a credential with
+`runpodctl registry create --name ghcr-dlc --username <user> --password <PAT
+with read:packages>` and pass the resulting id as `--registry-auth-id`. Do that
+in your own shell — a PAT on a command line lands in history.
+
 Two things that are easy to get wrong:
 
-- `--container-disk-in-gb` defaults to **20**, which cannot hold a ~13 GB image
-  plus its writable layer. 40 leaves headroom.
+- `--container-disk-in-gb` defaults to **20**. The image is 4.71 GB compressed
+  but ~13 GB unpacked on disk, plus the writable layer, so 20 is not enough.
+  40 leaves headroom.
 - `runpodctl create pod` (the old argument order, `--imageName`/`--gpuType`) is
   deprecated. The current form is `runpodctl pod create` with `--image` and
   `--gpu-id`, and `--env` takes a JSON object rather than `KEY=value`.
