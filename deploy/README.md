@@ -122,6 +122,42 @@ and uncheck *Shutdown source when not visible* so it keeps streaming while you
 are on another scene. The control page's **Copy OBS browser-source URL** button
 produces exactly this URL with the token and session filled in.
 
+### OBS and TLS
+
+OBS embeds CEF, which **rejects a self-signed certificate and offers no way to
+accept one**. So once TLS is enabled for a phone, OBS can no longer read the
+HTTPS origin. The server therefore listens twice:
+
+| Port | Scheme | For |
+|---|---|---|
+| `8080` | HTTPS | the phone — `getUserMedia` needs a secure context |
+| `8081` | HTTP | OBS on this machine — CEF cannot be given a cert to trust |
+
+`DLC_PLAIN_PORT` only opens when TLS is on. Publish it on loopback so it never
+reaches the network:
+
+```bash
+-p 8080:8080 -p 127.0.0.1:8081:8081
+```
+
+Note the bind inside the container is `0.0.0.0`, not `127.0.0.1`: Docker's port
+forwarder arrives over the bridge interface, so a container-loopback bind is
+unreachable and the port simply refuses connections. The restriction comes from
+the **publish address**, `-p 127.0.0.1:…`. Running outside a container, set
+`DLC_PLAIN_HOST=127.0.0.1` instead.
+
+The copy button accounts for this and hands out the `http://127.0.0.1:8081`
+origin, while **Open output window** stays on the HTTPS origin so it reuses the
+certificate you already accepted.
+
+### Which session the output follows
+
+Without `s`, the output follows whichever session **most recently produced a
+frame** — not the most recently opened one. With a control page idling on the
+laptop and a phone actually streaming, "newest session" picks the wrong one.
+`GET /sessions` lists the live sessions with frame counts and idle times if you
+want to pin one explicitly.
+
 `s` selects which session to mirror. Omit it and the output follows the most
 recent session, which is what you want with a single streamer; it matters only
 when `DLC_MAX_SESSIONS` is above 1.

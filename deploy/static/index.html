@@ -106,7 +106,7 @@ const statusEl = $("status");
 const token = new URLSearchParams(location.search).get("token") || "";
 
 let ws = null, stream = null, running = false;
-let inFlight = false, sourceReady = false, sessionId = "";
+let inFlight = false, sourceReady = false, sessionId = "", obsBase = "";
 let frames = 0, lastTick = performance.now(), lastLatency = 0, sentAt = 0;
 const canvas = document.createElement("canvas");
 const ctx = canvas.getContext("2d", { willReadFrequently: false });
@@ -256,6 +256,13 @@ $("start").addEventListener("click", async () => {
       if (body.type === "error") { setStatus("Error: " + body.message, "err"); return; }
       if (body.type === "hello") {
         sessionId = body.session || "";
+        obsBase = body.obs_base || "";
+        if (obsBase) {
+          $("obsHint").innerHTML =
+            'OBS cannot accept this page\'s self-signed certificate, so the copied URL ' +
+            'points at <b>' + obsBase + '</b> instead. Sources → + → <b>Browser</b>, ' +
+            'paste, 960×540, uncheck "Shutdown source when not visible".';
+        }
         fillModels(body.models, body.settings);
         applySettings(body.settings);
         setStatus(`Connected (session ${sessionId}). Choose a source face…`, "ok");
@@ -334,20 +341,23 @@ $("opacity").addEventListener("input", (e) => {
 });
 $("opacity").addEventListener("change", (e) => sendConfig({ opacity: parseFloat(e.target.value) }));
 
-function outputUrl(bare) {
+function outputUrl(bare, forObs) {
   const q = new URLSearchParams();
   if (token) q.set("token", token);
   if (sessionId) q.set("s", sessionId);
   if (bare) q.set("bare", "1");
-  return `${location.origin}/output?${q.toString()}`;
+  // OBS gets the plain loopback origin when TLS is on; a pop-out window stays
+  // on this page's origin so it shares the already-accepted certificate.
+  const base = (forObs && obsBase) ? obsBase : location.origin;
+  return `${base}/output?${q.toString()}`;
 }
 
 $("popout").addEventListener("click", () => {
-  window.open(outputUrl(false), "dlc-output", "width=980,height=580");
+  window.open(outputUrl(false, false), "dlc-output", "width=980,height=580");
 });
 
 $("copyObs").addEventListener("click", async () => {
-  const url = outputUrl(true);
+  const url = outputUrl(true, true);
   try {
     await navigator.clipboard.writeText(url);
     setStatus("OBS URL copied to clipboard.", "ok");

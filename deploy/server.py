@@ -35,6 +35,7 @@ import os
 import secrets
 import sys
 import threading
+import time
 import types
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Optional
@@ -77,6 +78,17 @@ NSFW_FILTER = _env_flag("DLC_NSFW_FILTER", True)
 
 TLS_CERT = os.environ.get("DLC_TLS_CERT", "").strip()
 TLS_KEY = os.environ.get("DLC_TLS_KEY", "").strip()
+# When TLS is on, also serve plain HTTP on loopback. OBS's browser source is
+# CEF, which rejects a self-signed certificate outright and offers no way to
+# accept one, so a local consumer needs a non-TLS door. Loopback only: the
+# token would otherwise cross the LAN in cleartext.
+PLAIN_PORT = int(os.environ.get("DLC_PLAIN_PORT", "8081"))
+# Bind address for that port. Inside a container this must be 0.0.0.0: binding
+# the container's own 127.0.0.1 is unreachable, because Docker's forwarder
+# arrives over the bridge interface, not loopback. Restrict exposure on the
+# host side instead, with `-p 127.0.0.1:8081:8081`. Outside a container, set
+# this to 127.0.0.1.
+PLAIN_HOST = os.environ.get("DLC_PLAIN_HOST", "0.0.0.0")
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 MODELS_DIR = os.path.join(ROOT_DIR, "models")
@@ -147,6 +159,19 @@ def set_precision(precision: str) -> str:
         _current_precision = precision
         _LOG.info("swapper precision -> %s (%s)", precision, PRECISIONS[precision])
         return _current_precision
+
+
+def obs_base() -> Optional[str]:
+    """Origin an OBS browser source should use.
+
+    Only meaningful when TLS is on: OBS embeds CEF, which refuses a self-signed
+    certificate and gives no way to accept one, so the copy-URL button in the
+    control page has to point at the plain loopback port instead of the HTTPS
+    origin the page itself was loaded from.
+    """
+    if TLS_CERT and TLS_KEY and PLAIN_PORT:
+        return f"http://127.0.0.1:{PLAIN_PORT}"
+    return None
 
 
 def current_settings():
@@ -280,6 +305,12 @@ class Session:
         self.source_face = None
         self.slot = LatestSlot()
         self.broadcast = Broadcast(placeholder_jpeg("waiting for stream"))
+        # Counters exist to answer "is the client actually sending frames?".
+        # Without them a silent client and a broken swap look identical here.
+        self.frames_in = 0
+        self.frames_out = 0
+        self.bytes_in = 0
+        self.last_frame_at = 0.0
 
 
 def authorized(request: web.Request) -> bool:
@@ -295,15 +326,39 @@ def authorized(request: web.Request) -> bool:
 def resolve_session(request: web.Request) -> Optional["Session"]:
     """Pick the session an output view should follow.
 
-    An explicit ?s= wins; otherwise fall back to the most recent session so
-    that pointing OBS at /output with just a token does the obvious thing.
+    An explicit ?s= wins. Otherwise follow whichever session most recently
+    produced a frame, not the most recently opened one: with a control page
+    idling on the laptop and a phone actually streaming, "newest session" picks
+    the wrong one.
     """
     sid = request.query.get("s")
     if sid:
         return _sessions.get(sid)
+    active = [s for s in _sessions.values() if s.frames_out]
+    if active:
+        return max(active, key=lambda s: s.last_frame_at)
     if _last_session_id:
         return _sessions.get(_last_session_id)
     return None
+
+
+async def handle_sessions(request: web.Request) -> web.Response:
+    """Which sessions exist and which are live — for picking an output source."""
+    if not authorized(request):
+        return web.json_response({"error": "unauthorized"}, status=401)
+    now = time.monotonic()
+    return web.json_response({
+        "sessions": [
+            {
+                "id": s.id,
+                "frames_in": s.frames_in,
+                "frames_out": s.frames_out,
+                "idle_s": round(now - s.last_frame_at, 1) if s.last_frame_at else None,
+                "has_source": s.source_face is not None,
+            }
+            for s in _sessions.values()
+        ]
+    })
 
 
 # --- Handlers -----------------------------------------------------------------
@@ -329,6 +384,7 @@ async def handle_models(request: web.Request) -> web.Response:
     return web.json_response({
         "models": available_models(),
         "settings": current_settings(),
+        "obs_base": obs_base(),
     })
 
 
@@ -383,6 +439,8 @@ async def process_loop(ws: web.WebSocketResponse, session: Session) -> None:
             await ws.send_json({"type": "error", "message": f"swap failed: {exc}"})
             continue
         if out is not None:
+            session.frames_out += 1
+            session.last_frame_at = time.monotonic()
             await session.broadcast.publish(out)
             if not ws.closed:
                 await ws.send_bytes(out)
@@ -405,7 +463,11 @@ async def handle_ws(request: web.Request) -> web.StreamResponse:
         _sessions[sid] = session
         _last_session_id = sid
 
-    ws = web.WebSocketResponse(max_msg_size=16 * 1024 * 1024, heartbeat=20)
+    # compress=False: the payload is JPEG, which does not compress further, so
+    # permessage-deflate only burns CPU. It also removes the extension
+    # negotiation that produced "Received frame with non-zero reserved bits".
+    ws = web.WebSocketResponse(max_msg_size=16 * 1024 * 1024, heartbeat=20,
+                               compress=False)
     await ws.prepare(request)
     consumer = asyncio.create_task(process_loop(ws, session))
     _LOG.info("session %s opened (%d/%d)", sid, len(_sessions), MAX_SESSIONS)
@@ -416,9 +478,19 @@ async def handle_ws(request: web.Request) -> web.StreamResponse:
             "session": sid,
             "models": available_models(),
             "settings": current_settings(),
+            "obs_base": obs_base(),
         })
         async for msg in ws:
             if msg.type == WSMsgType.BINARY:
+                session.frames_in += 1
+                session.bytes_in += len(msg.data)
+                if session.frames_in == 1:
+                    _LOG.info("session %s: first frame in (%d bytes)",
+                              sid, len(msg.data))
+                elif session.frames_in % 100 == 0:
+                    _LOG.info("session %s: %d in / %d out, avg %.0f KB/frame",
+                              sid, session.frames_in, session.frames_out,
+                              session.bytes_in / session.frames_in / 1024)
                 session.slot.put(msg.data)
             elif msg.type == WSMsgType.TEXT:
                 try:
@@ -437,7 +509,11 @@ async def handle_ws(request: web.Request) -> web.StreamResponse:
         consumer.cancel()
         async with _sessions_lock:
             _sessions.pop(sid, None)
-        _LOG.info("session %s closed", sid)
+        _LOG.info("session %s closed after %d frames in / %d out%s",
+                  sid, session.frames_in, session.frames_out,
+                  "" if session.frames_in else
+                  " - CLIENT SENT NO FRAMES (camera never started, or the "
+                  "page was backgrounded)")
     return ws
 
 
@@ -505,6 +581,7 @@ def build_app() -> web.Application:
     app.router.add_get("/output", handle_output)
     app.router.add_get("/stream.mjpg", handle_mjpeg)
     app.router.add_get("/models", handle_models)
+    app.router.add_get("/sessions", handle_sessions)
     app.router.add_get("/healthz", handle_health)
     app.router.add_get("/ws", handle_ws)
     app.router.add_static("/static/", STATIC_DIR)
@@ -549,11 +626,32 @@ def main() -> None:
 
     configure_globals()
     ssl_ctx = build_ssl_context()
-    _LOG.info("starting on :%d (%s nsfw_filter=%s max_sessions=%d models=%s)",
-              PORT, "https" if ssl_ctx else "http", NSFW_FILTER, MAX_SESSIONS,
+    _LOG.info("starting (nsfw_filter=%s max_sessions=%d models=%s)",
+              NSFW_FILTER, MAX_SESSIONS,
               ",".join(m["id"] for m in available_models()))
-    web.run_app(build_app(), host="0.0.0.0", port=PORT,
-                ssl_context=ssl_ctx, access_log=None)
+    asyncio.run(serve(ssl_ctx))
+
+
+async def serve(ssl_ctx) -> None:
+    runner = web.AppRunner(build_app(), access_log=None)
+    await runner.setup()
+
+    await web.TCPSite(runner, "0.0.0.0", PORT, ssl_context=ssl_ctx).start()
+    _LOG.info("listening on %s://0.0.0.0:%d",
+              "https" if ssl_ctx else "http", PORT)
+
+    if ssl_ctx and PLAIN_PORT:
+        # Exists so a local CEF client (OBS) can read /output without a
+        # certificate it cannot be made to trust. Keep it off the LAN by
+        # publishing it as -p 127.0.0.1:8081:8081, not by binding loopback here.
+        await web.TCPSite(runner, PLAIN_HOST, PLAIN_PORT).start()
+        _LOG.info("listening on http://%s:%d (plain, for OBS; publish on "
+                  "127.0.0.1 to keep it off the LAN)", PLAIN_HOST, PLAIN_PORT)
+
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await runner.cleanup()
 
 
 if __name__ == "__main__":
