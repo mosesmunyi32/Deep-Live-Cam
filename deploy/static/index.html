@@ -23,11 +23,40 @@
   h1 { font-size: 17px; margin: 0 0 2px; font-weight: 600; }
   .sub { color: var(--muted); font-size: 13px; margin-bottom: 14px; }
 
-  /* --- video stage: side by side on desktop, stacked on phone --- */
-  .stage { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
-  figure { margin: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
-  figcaption { padding: 7px 11px; color: var(--muted); font-size: 12px; border-bottom: 1px solid var(--line); }
-  video, img#out { width: 100%; display: block; background: #000; aspect-ratio: 4/3; object-fit: contain; }
+  /* --- video stage ---
+     Sticks to the top of the viewport so the effect of a slider is visible
+     while the slider is being dragged. Capped by viewport height rather than a
+     fixed size, so it can never grow to fill the screen and hide the controls
+     it exists to demonstrate. */
+  .stage {
+    position: sticky; top: 0; z-index: 4;
+    display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
+    background: var(--bg); padding: 6px 0 10px; margin-bottom: 4px;
+  }
+  figure {
+    margin: 0; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; overflow: hidden; position: relative;
+  }
+  figcaption {
+    padding: 7px 11px; color: var(--muted); font-size: 12px;
+    border-bottom: 1px solid var(--line);
+  }
+  video, img#out {
+    width: 100%; display: block; background: #000;
+    aspect-ratio: 4/3; object-fit: contain;
+    max-height: 38vh;
+  }
+  #shrink {
+    position: absolute; top: 4px; right: 6px; z-index: 2;
+    background: rgba(13,17,23,.75); border: 1px solid var(--line);
+    color: var(--fg); border-radius: 6px;
+    padding: 2px 8px; min-height: 0; font-size: 12px; line-height: 1.6;
+  }
+  /* Compact: output only, camera hidden — maximum room for controls. */
+  body.compact .stage { grid-template-columns: 1fr; }
+  body.compact figure.cam { display: none; }
+  body.compact video, body.compact img#out { max-height: 22vh; }
+  body.compact figcaption { padding: 3px 9px; font-size: 11px; }
 
   /* --- primary bar stays visible; everything else collapses --- */
   .primary-bar {
@@ -88,7 +117,11 @@
 
   @media (max-width: 720px) {
     body { padding: 12px 12px calc(12px + env(safe-area-inset-bottom)); font-size: 16px; }
-    .stage { grid-template-columns: 1fr; }
+    /* Side by side, not stacked: two stacked panes would use the whole screen
+       once the stage is sticky, leaving nothing to scroll. */
+    .stage { gap: 6px; padding: 4px 0 8px; }
+    video, img#out { max-height: 26vh; }
+    figcaption { padding: 4px 8px; font-size: 11px; }
     /* One control per line: side-by-side sliders are unusable at thumb width. */
     .body > label, .body > button, .body > .hint { flex: 1 1 100%; }
     .body > label { justify-content: space-between; }
@@ -104,8 +137,8 @@
 <div class="sub">Frames go to the GPU and come back swapped.</div>
 
 <div class="stage">
-  <figure><figcaption>Camera</figcaption><video id="cam" autoplay playsinline muted></video></figure>
-  <figure><figcaption>Output</figcaption><img id="out" alt="swapped output"></figure>
+  <figure class="cam"><figcaption>Camera</figcaption><video id="cam" autoplay playsinline muted></video></figure>
+  <figure><figcaption>Output</figcaption><img id="out" alt="swapped output"><button id="shrink" title="Hide the camera pane for more room">⤢</button></figure>
 </div>
 
 <div class="primary-bar">
@@ -205,6 +238,17 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
+
+// Compact hides the camera pane and shrinks the output, so the sticky stage
+// leaves room for the controls on a short screen. Remembered per browser.
+if (localStorage.getItem("compact") === "1") document.body.classList.add("compact");
+document.getElementById("shrink").addEventListener("click", () => {
+  const on = document.body.classList.toggle("compact");
+  localStorage.setItem("compact", on ? "1" : "0");
+  document.getElementById("shrink").textContent = on ? "⤡" : "⤢";
+});
+document.getElementById("shrink").textContent =
+  document.body.classList.contains("compact") ? "⤡" : "⤢";
 const statusEl = $("status");
 const token = new URLSearchParams(location.search).get("token") || "";
 
