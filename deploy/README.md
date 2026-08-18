@@ -167,10 +167,53 @@ WebSocket, because the output window is a different client from the one sending
 camera frames. The page reconnects with backoff if the stream drops, so OBS
 recovers on its own across a server restart.
 
+## Adding models
+
+`GET /models` lists **every `.onnx` in `models/`**, so adding one is a file
+copy — no code change:
+
+```bash
+cp my_swapper.onnx models/
+# models/ is bind-mounted, so it appears in the selector on reconnect
+docker run ... -v "$PWD/models:/app/models:ro" ...
+```
+
+To ship it in the deployed image instead, add a download line beside the
+existing ones in `deploy/Dockerfile` so cold pods still fetch nothing.
+
+Only **inswapper-architecture** models actually load. Selection validates that
+what came back is a swapper — insightface will happily return a detector or
+recogniser for the wrong file, and without the check that surfaces much later
+as a confusing error inside `swap_face`. Incompatible files are listed but
+rejected with the reason, rather than hidden, so a model that does not work
+says why. Filenames are basename-checked; path traversal is refused.
+
+Face enhancers (`face_enhancer`, GPEN 256/512) are a different processor
+upstream and are not offered here: their weights are not in the image, and at
+their per-frame cost they are not viable for a live stream. They are worth
+baking in for still or offline video work.
+
+## Lighting and camera controls
+
+Two independent layers, because device support is unreliable:
+
+- **Lighting** (brightness / contrast / saturation) is applied **on the server,
+  before the swap**. Before rather than after on purpose: poor lighting costs
+  detections, and a frame the detector misses cannot be swapped at all. Each
+  step is skipped when it would be a no-op, so the default path costs nothing.
+  This works on every device.
+- **Camera controls** are the device's own, built at runtime from
+  `track.getCapabilities()` — zoom, exposure, white balance, torch, focus mode
+  and so on. Nothing is hardcoded, because support is wildly uneven: Chrome on
+  Android exposes a lot, **iOS Safari usually exposes none at all**. When a
+  device reports nothing adjustable, the row says so and points at the
+  server-side lighting controls.
+
+So on an iPhone, expect the native row to be empty and use Lighting instead.
+
 ## Choosing the model
 
-The control page's **Model** selector switches between the two baked inswapper
-variants at runtime; `GET /models` lists what the image actually contains.
+The control page's **Model** selector switches models at runtime.
 
 Switching is **process-wide, not per-session** — these are module-level globals
 in the upstream processor, so a change affects every connected client. The same

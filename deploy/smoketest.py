@@ -45,8 +45,7 @@ async def main():
     ap.add_argument("--url", default="http://127.0.0.1:8080")
     ap.add_argument("--token", required=True)
     ap.add_argument("--frames", type=int, default=20)
-    ap.add_argument("--precision", choices=["fp32", "fp16"],
-                    help="switch the swapper model before measuring")
+    ap.add_argument("--model", help="swapper model filename to load before measuring")
     args = ap.parse_args()
 
     import aiohttp
@@ -86,15 +85,15 @@ async def main():
                 print("FAIL: source face was rejected")
                 return 1
 
-            if args.precision:
-                await ws.send_json({"type": "config", "precision": args.precision})
+            if args.model:
+                await ws.send_json({"type": "config", "model": args.model})
                 msg = await asyncio.wait_for(ws.receive_json(), timeout=120)
                 if msg.get("type") != "settings":
                     print(f"FAIL: model switch rejected: {msg}")
                     return 1
-                got = msg["settings"]["precision"]
-                if got != args.precision:
-                    print(f"FAIL: asked for {args.precision}, server reports {got}")
+                got = msg["settings"]["model"]
+                if got != args.model:
+                    print(f"FAIL: asked for {args.model}, server reports {got}")
                     return 1
                 print(f"model switched -> {got}")
                 # Reloaded model pays autotuning on its first frames; burn a few.

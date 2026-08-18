@@ -42,6 +42,9 @@
   .hint b { color: var(--fg); }
   input[type=range] { accent-color: var(--accent); }
   input[type=checkbox] { accent-color: var(--accent); }
+  .rowlabel { color: var(--fg); font-weight: 600; flex-basis: 100%; }
+  .rowlabel em { color: var(--muted); font-weight: 400; font-style: normal; font-size: 12px; }
+  .camctl { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; color: var(--muted); }
 </style>
 </head>
 <body>
@@ -85,6 +88,19 @@
   <label><input type="checkbox" id="manyFaces"> All faces</label>
   <label><input type="checkbox" id="mouthMask"> Mouth mask</label>
   <label><input type="checkbox" id="colorCorrection" checked> Colour correct</label>
+</div>
+
+<div class="controls">
+  <span class="rowlabel">Lighting <em>(server-side, always available)</em></span>
+  <label>Brightness <input type="range" id="brightness" min="-100" max="100" step="1" value="0"><span id="brightnessVal" class="mono">0</span></label>
+  <label>Contrast <input type="range" id="contrast" min="0.2" max="3" step="0.05" value="1"><span id="contrastVal" class="mono">1.00</span></label>
+  <label>Saturation <input type="range" id="saturation" min="0" max="3" step="0.05" value="1"><span id="saturationVal" class="mono">1.00</span></label>
+  <button id="resetAdjust">Reset</button>
+</div>
+
+<div class="controls" id="camControlsRow">
+  <span class="rowlabel">Camera controls <em>(native, device-dependent)</em></span>
+  <div id="camControls" class="camctl">Start the camera to see what it supports.</div>
 </div>
 
 <div class="controls">
@@ -208,6 +224,7 @@ async function switchCamera() {
   }
   $("cam").srcObject = stream;
   inFlight = false;   // a frame from the old device will never be answered
+  buildCameraControls();
   setStatus("Camera switched.", "ok");
 }
 
@@ -232,6 +249,7 @@ $("start").addEventListener("click", async () => {
   // Labels are only exposed once permission has been granted, so re-enumerate
   // now to replace "Camera 1/2" with the real device names.
   listCameras();
+  buildCameraControls();
   $("cam").srcObject = stream;
 
   ws = new WebSocket(wsUrl());
@@ -305,15 +323,18 @@ function fillModels(models, settings) {
   (models || []).forEach((m) => {
     const o = document.createElement("option");
     o.value = m.id;
-    o.textContent = `${m.id} — ${m.file} (${m.size_mb} MB)`;
+    o.textContent = `${m.label} (${m.size_mb} MB)`;
     sel.appendChild(o);
   });
-  if (settings) sel.value = settings.precision;
+  if (settings) sel.value = settings.model;
 }
 
 function applySettings(st) {
   if (!st) return;
-  $("model").value = st.precision;
+  $("model").value = st.model;
+  $("brightness").value = st.brightness; $("brightnessVal").textContent = st.brightness;
+  $("contrast").value = st.contrast; $("contrastVal").textContent = Number(st.contrast).toFixed(2);
+  $("saturation").value = st.saturation; $("saturationVal").textContent = Number(st.saturation).toFixed(2);
   $("manyFaces").checked = st.many_faces;
   $("mouthMask").checked = st.mouth_mask;
   $("colorCorrection").checked = st.color_correction;
@@ -330,8 +351,8 @@ function sendConfig(patch) {
 }
 
 $("model").addEventListener("change", (e) => {
-  setStatus(`Loading ${e.target.value} model…`);
-  sendConfig({ precision: e.target.value });
+  setStatus(`Loading ${e.target.value}…`);
+  sendConfig({ model: e.target.value });
 });
 $("manyFaces").addEventListener("change", (e) => sendConfig({ many_faces: e.target.checked }));
 $("mouthMask").addEventListener("change", (e) => sendConfig({ mouth_mask: e.target.checked }));
@@ -340,6 +361,103 @@ $("opacity").addEventListener("input", (e) => {
   $("opacityVal").textContent = Number(e.target.value).toFixed(2);
 });
 $("opacity").addEventListener("change", (e) => sendConfig({ opacity: parseFloat(e.target.value) }));
+
+[["brightness", 0], ["contrast", 2], ["saturation", 2]].forEach(([id, dp]) => {
+  const el = $(id);
+  el.addEventListener("input", () => {
+    $(id + "Val").textContent = dp ? Number(el.value).toFixed(dp) : el.value;
+  });
+  el.addEventListener("change", () => sendConfig({ [id]: parseFloat(el.value) }));
+});
+
+$("resetAdjust").addEventListener("click", () => {
+  sendConfig({ brightness: 0, contrast: 1, saturation: 1 });
+});
+
+// Native camera controls are built from what this specific device reports.
+// Support is wildly uneven - Chrome on Android exposes a lot, Safari on iOS
+// almost nothing - so nothing is hardcoded and the fallback points at the
+// server-side lighting row, which works everywhere.
+const CAM_NUMERIC = [
+  ["zoom", "Zoom"], ["brightness", "Brightness"], ["contrast", "Contrast"],
+  ["saturation", "Saturation"], ["sharpness", "Sharpness"],
+  ["exposureCompensation", "Exposure comp"], ["exposureTime", "Exposure time"],
+  ["iso", "ISO"], ["colorTemperature", "White balance (K)"],
+  ["focusDistance", "Focus distance"],
+];
+
+function buildCameraControls() {
+  const box = $("camControls");
+  box.innerHTML = "";
+  const track = stream && stream.getVideoTracks()[0];
+  if (!track || typeof track.getCapabilities !== "function") {
+    box.textContent = "This browser does not expose camera capabilities — use the Lighting row above.";
+    return;
+  }
+
+  let caps = {}, cur = {};
+  try { caps = track.getCapabilities() || {}; cur = track.getSettings() || {}; }
+  catch { box.textContent = "Camera capabilities unavailable — use the Lighting row above."; return; }
+
+  const apply = (name, value) =>
+    track.applyConstraints({ advanced: [{ [name]: value }] })
+      .catch((e) => setStatus(`${name} not accepted: ${e.message}`, "err"));
+
+  let count = 0;
+  CAM_NUMERIC.forEach(([name, label]) => {
+    const c = caps[name];
+    if (!c || typeof c.min !== "number" || c.min === c.max) return;
+    count++;
+    const wrap = document.createElement("label");
+    const out = document.createElement("span");
+    out.className = "mono";
+    const step = c.step || (c.max - c.min) / 100;
+    const input = document.createElement("input");
+    input.type = "range";
+    input.min = c.min; input.max = c.max; input.step = step;
+    input.value = cur[name] !== undefined ? cur[name] : c.min;
+    out.textContent = Number(input.value).toFixed(2);
+    input.addEventListener("input", () => { out.textContent = Number(input.value).toFixed(2); });
+    input.addEventListener("change", () => apply(name, parseFloat(input.value)));
+    wrap.append(label + " ", input, out);
+    box.appendChild(wrap);
+  });
+
+  [["torch", "Torch"]].forEach(([name, label]) => {
+    if (!caps[name]) return;
+    count++;
+    const wrap = document.createElement("label");
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = !!cur[name];
+    cb.addEventListener("change", () => apply(name, cb.checked));
+    wrap.append(cb, " " + label);
+    box.appendChild(wrap);
+  });
+
+  ["exposureMode", "whiteBalanceMode", "focusMode"].forEach((name) => {
+    const modes = caps[name];
+    if (!Array.isArray(modes) || modes.length < 2) return;
+    count++;
+    const wrap = document.createElement("label");
+    const sel = document.createElement("select");
+    modes.forEach((m) => {
+      const o = document.createElement("option");
+      o.value = m; o.textContent = m;
+      sel.appendChild(o);
+    });
+    if (cur[name]) sel.value = cur[name];
+    sel.addEventListener("change", () => apply(name, sel.value));
+    wrap.append(name.replace("Mode", " mode") + " ", sel);
+    box.appendChild(wrap);
+  });
+
+  if (!count) {
+    box.textContent =
+      "This device exposes no adjustable camera controls (iOS Safari usually does not) — " +
+      "use the Lighting row above, which is applied on the server and works everywhere.";
+  }
+}
 
 function outputUrl(bare, forObs) {
   const q = new URLSearchParams();

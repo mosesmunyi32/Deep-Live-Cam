@@ -107,58 +107,91 @@ _last_session_id: Optional[str] = None
 # Both inswapper variants are baked into the image. Upstream picks between them
 # with a torch.cuda probe; torch is not installed, so the choice is driven here.
 
-PRECISIONS = {
-    "fp32": "inswapper_128.onnx",
-    "fp16": "inswapper_128_fp16.onnx",
+# Friendly names for the two variants the image ships with. Anything else
+# dropped into models/ is offered under its filename.
+KNOWN_LABELS = {
+    "inswapper_128.onnx": "fp32 (default)",
+    "inswapper_128_fp16.onnx": "fp16",
 }
+DEFAULT_MODEL = "inswapper_128.onnx"
+
 _model_lock = threading.Lock()
-_current_precision = "fp32"
+_current_model = DEFAULT_MODEL
 
 
 def available_models():
+    """Every .onnx in models/ — drop a file in and it shows up.
+
+    Only inswapper-architecture models actually load; the rest are rejected at
+    selection time with the reason, rather than being hidden here, so a model
+    that does not work says why.
+    """
     out = []
-    for pid, fname in PRECISIONS.items():
+    try:
+        names = sorted(os.listdir(MODELS_DIR))
+    except OSError:
+        return out
+    for fname in names:
+        if not fname.endswith(".onnx"):
+            continue
         path = os.path.join(MODELS_DIR, fname)
-        if os.path.exists(path):
-            out.append({
-                "id": pid,
-                "file": fname,
-                "size_mb": round(os.path.getsize(path) / 1e6),
-            })
+        out.append({
+            "id": fname,
+            "file": fname,
+            "label": KNOWN_LABELS.get(fname, fname[:-5]),
+            "size_mb": round(os.path.getsize(path) / 1e6),
+            "builtin": fname in KNOWN_LABELS,
+        })
     return out
 
 
-def set_precision(precision: str) -> str:
-    """Switch the inswapper variant. Global — it affects every session."""
-    global _current_precision
-    if precision not in PRECISIONS:
-        raise ValueError(f"unknown precision {precision!r}")
-    if not os.path.exists(os.path.join(MODELS_DIR, PRECISIONS[precision])):
-        raise ValueError(f"{PRECISIONS[precision]} is not present in the image")
+def set_model(fname: str) -> str:
+    """Load a swapper model by filename. Global — it affects every session."""
+    global _current_model
+
+    # Reject traversal: this name reaches the filesystem.
+    if fname != os.path.basename(fname) or not fname.endswith(".onnx"):
+        raise ValueError(f"invalid model name {fname!r}")
+    path = os.path.join(MODELS_DIR, fname)
+    if not os.path.exists(path):
+        raise ValueError(f"{fname} is not in {MODELS_DIR}")
 
     with _model_lock:
-        if precision == _current_precision:
-            return _current_precision
+        if fname == _current_model and face_swapper.FACE_SWAPPER is not None:
+            return _current_model
 
-        # Upstream gates fp16 on torch.cuda purely as a "is there a usable GPU"
-        # probe. onnxruntime already answered that, so drive the gate directly
-        # rather than installing ~2.5 GB of torch to satisfy it.
-        face_swapper._HAS_TORCH_CUDA = (precision == "fp16")
-        face_swapper.FACE_SWAPPER = None
+        import insightface
 
-        # The CUDA graph is recorded against one model's input/output buffers.
-        # Carrying it across a model change would replay the previous model.
+        previous = face_swapper.FACE_SWAPPER
+        try:
+            model = insightface.model_zoo.get_model(
+                path, providers=modules.globals.execution_providers)
+        except Exception as exc:
+            raise ValueError(f"{fname} failed to load: {exc}") from exc
+
+        # insightface happily returns a detector or recogniser for the wrong
+        # file. Without this check the failure would surface much later as a
+        # confusing error inside swap_face.
+        if not hasattr(model, "get") or not hasattr(model, "input_size"):
+            raise ValueError(
+                f"{fname} loaded but is not a face-swapper model "
+                "(no get()/input_size) - inswapper-architecture models only")
+
+        # The CUDA graph is recorded against one model's input/output buffers,
+        # so it must not survive a model change. It is only ever recorded when
+        # _HAS_TORCH_CUDA is set, but reset it regardless.
         face_swapper._cuda_graph_session.update(
             session=None, io_binding=None, ort_input=None,
             ort_latent=None, recorded=False,
         )
         face_swapper.FACE_DETECTION_CACHE.clear()
         face_swapper.FRAME_CACHE.clear()
+        face_swapper.FACE_SWAPPER = model
+        del previous
 
-        face_swapper.get_face_swapper()   # load now, not on the next frame
-        _current_precision = precision
-        _LOG.info("swapper precision -> %s (%s)", precision, PRECISIONS[precision])
-        return _current_precision
+        _current_model = fname
+        _LOG.info("swapper model -> %s (input %s)", fname, model.input_size)
+        return _current_model
 
 
 def obs_base() -> Optional[str]:
@@ -174,9 +207,32 @@ def obs_base() -> Optional[str]:
     return None
 
 
+_adjust = {"brightness": 0.0, "contrast": 1.0, "saturation": 1.0}
+
+
+def adjust_frame(frame: np.ndarray) -> np.ndarray:
+    """Cheap exposure/colour correction, applied before the swap.
+
+    Before rather than after on purpose: poor lighting costs detections, and a
+    frame the detector misses cannot be swapped at all. Each step is skipped
+    when it would be a no-op, so the default path costs nothing.
+    """
+    b, c, sat = _adjust["brightness"], _adjust["contrast"], _adjust["saturation"]
+    if c != 1.0 or b != 0.0:
+        frame = cv2.convertScaleAbs(frame, alpha=c, beta=b)
+    if sat != 1.0:
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).astype(np.float32)
+        hsv[..., 1] *= sat
+        frame = cv2.cvtColor(np.clip(hsv, 0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR)
+    return frame
+
+
 def current_settings():
     return {
-        "precision": _current_precision,
+        "model": _current_model,
+        "brightness": _adjust["brightness"],
+        "contrast": _adjust["contrast"],
+        "saturation": _adjust["saturation"],
         "many_faces": bool(modules.globals.many_faces),
         "mouth_mask": bool(getattr(modules.globals, "mouth_mask", False)),
         "opacity": float(getattr(modules.globals, "opacity", 1.0)),
@@ -220,7 +276,7 @@ def warm_up() -> None:
             "The image should have baked it in; check the Dockerfile download step."
         )
     face_swapper.process_frame(None, np.zeros((480, 640, 3), dtype=np.uint8))
-    _LOG.info("warm-up complete")
+    _LOG.info("warm-up complete (model %s)", _current_model)
 
 
 def decode_jpeg(payload: bytes) -> Optional[np.ndarray]:
@@ -232,6 +288,7 @@ def swap_jpeg(source_face, payload: bytes) -> Optional[bytes]:
     frame = decode_jpeg(payload)
     if frame is None:
         return None
+    frame = adjust_frame(frame)
     swapped = face_swapper.process_frame(source_face, frame)
     ok, encoded = cv2.imencode(".jpg", swapped, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
     return encoded.tobytes() if ok else None
@@ -521,10 +578,15 @@ async def apply_config(ws: web.WebSocketResponse, body: dict) -> None:
     """Apply settings. These are process-wide, so they affect every session."""
     loop = asyncio.get_running_loop()
     try:
-        if "precision" in body:
+        if "model" in body:
             # Model reload is blocking and touches the GPU: keep it on the
             # inference thread so it cannot overlap a swap in flight.
-            await loop.run_in_executor(EXECUTOR, set_precision, body["precision"])
+            await loop.run_in_executor(EXECUTOR, set_model, body["model"])
+        for key, lo, hi in (("brightness", -100.0, 100.0),
+                            ("contrast", 0.2, 3.0),
+                            ("saturation", 0.0, 3.0)):
+            if key in body:
+                _adjust[key] = max(lo, min(hi, float(body[key])))
         if "many_faces" in body:
             modules.globals.many_faces = bool(body["many_faces"])
         if "mouth_mask" in body:
