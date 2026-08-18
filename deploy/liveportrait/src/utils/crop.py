@@ -11,7 +11,10 @@ from math import sin, cos, acos, degrees
 import cv2
 import torch
 import torch.nn.functional as F
-import torchgeometry as tgm
+# torchgeometry was last released in 2019 against torch 1.0 and breaks on
+# modern torch. kornia is its maintained successor and warp_affine has the same
+# signature, so aliasing it keeps the single call site below unchanged.
+import kornia.geometry.transform as tgm
 
 DTYPE = np.float32
 CV2_INTERP = cv2.INTER_LINEAR

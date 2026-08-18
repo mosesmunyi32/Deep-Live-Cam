@@ -53,3 +53,8 @@ torch>=2.6
 torchvision>=0.21
 pyyaml>=6.0
 omegaconf>=2.3
+ffmpeg-python>=0.2
+# kornia replaces torchgeometry, which the vendored crop.py originally imported.
+# torchgeometry was last released in 2019 against torch 1.0; kornia is the
+# maintained successor and warp_affine - the only function used - matches.
+kornia>=0.7
