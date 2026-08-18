@@ -40,6 +40,25 @@ browser ──getUserMedia──▶ canvas ──JPEG──▶ WebSocket ──�
 A single worker thread serializes GPU access; a one-slot mailbox (`LatestSlot`)
 drops stale frames so latency stays bounded when inference falls behind.
 
+## Choosing the camera
+
+The control page lists every `videoinput` device and passes the chosen one to
+`getUserMedia` as an exact `deviceId`. Changing the selector while streaming
+swaps the local capture only — the session, the socket and the loaded source
+face all survive.
+
+Two browser behaviours the selector has to work around:
+
+- **Device labels are hidden until permission is granted.** Before the first
+  successful `getUserMedia` the list shows `Camera 1`, `Camera 2`; the page
+  re-enumerates immediately after Start to replace those with real names.
+- **An exact `deviceId` fails hard** if that camera is busy or unplugged, so a
+  failure falls back to the default device with a visible notice rather than
+  leaving a dead preview.
+
+`⟳` re-scans on demand, and the page also listens for `devicechange`, so
+plugging a webcam in mid-session updates the list by itself.
+
 ## Output view and OBS
 
 The control page at `/` is for driving the swap. The swapped frames are also

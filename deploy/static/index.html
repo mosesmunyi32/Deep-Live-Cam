@@ -51,6 +51,10 @@
 
 <div class="controls">
   <label>Source face <input type="file" id="srcFile" accept="image/*"></label>
+  <label>Camera
+    <select id="camera"><option value="">default</option></select>
+  </label>
+  <button id="refreshCams" title="Re-scan for cameras">⟳</button>
   <label>FPS cap
     <select id="fps">
       <option value="10">10</option>
@@ -134,17 +138,100 @@ $("srcFile").addEventListener("change", async (ev) => {
   }
 });
 
+async function listCameras() {
+  const sel = $("camera");
+  const previous = sel.value;
+  let devices = [];
+  try {
+    devices = await navigator.mediaDevices.enumerateDevices();
+  } catch (err) {
+    setStatus("Could not enumerate devices: " + err.message, "err");
+    return;
+  }
+  const cams = devices.filter((d) => d.kind === "videoinput");
+  sel.innerHTML = "";
+
+  const def = document.createElement("option");
+  def.value = "";
+  def.textContent = cams.length ? "default" : "no camera found";
+  sel.appendChild(def);
+
+  cams.forEach((d, i) => {
+    const o = document.createElement("option");
+    o.value = d.deviceId;
+    // Labels are empty until getUserMedia has been granted once, so fall back
+    // to a positional name rather than showing blank rows.
+    o.textContent = d.label || `Camera ${i + 1}`;
+    sel.appendChild(o);
+  });
+
+  if (previous && cams.some((d) => d.deviceId === previous)) sel.value = previous;
+}
+
+async function openCamera() {
+  const width = parseInt($("width").value, 10);
+  const deviceId = $("camera").value;
+  const video = {
+    width: { ideal: width },
+    height: { ideal: Math.round(width * 3 / 4) },
+  };
+  if (deviceId) video.deviceId = { exact: deviceId };
+
+  try {
+    return await navigator.mediaDevices.getUserMedia({ video, audio: false });
+  } catch (err) {
+    // exact deviceId fails outright if that camera is busy or gone; a nameless
+    // failure is worse than quietly falling back to whatever is available.
+    if (deviceId && (err.name === "OverconstrainedError" || err.name === "NotFoundError")) {
+      setStatus("That camera is unavailable — using the default instead.", "err");
+      delete video.deviceId;
+      return await navigator.mediaDevices.getUserMedia({ video, audio: false });
+    }
+    throw err;
+  }
+}
+
+function stopCamera() {
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  stream = null;
+}
+
+// Swap the camera without dropping the session: only the local capture changes.
+async function switchCamera() {
+  if (!running) return;
+  stopCamera();
+  try {
+    stream = await openCamera();
+  } catch (err) {
+    setStatus("Camera switch failed: " + err.message, "err");
+    return;
+  }
+  $("cam").srcObject = stream;
+  inFlight = false;   // a frame from the old device will never be answered
+  setStatus("Camera switched.", "ok");
+}
+
+$("camera").addEventListener("change", switchCamera);
+$("width").addEventListener("change", switchCamera);
+$("refreshCams").addEventListener("click", listCameras);
+
+// Fires when a webcam is plugged in or removed.
+if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+  navigator.mediaDevices.addEventListener("devicechange", listCameras);
+}
+
+listCameras();
+
 $("start").addEventListener("click", async () => {
   try {
-    const width = parseInt($("width").value, 10);
-    stream = await navigator.mediaDevices.getUserMedia({
-      video: { width: { ideal: width }, height: { ideal: Math.round(width * 3 / 4) } },
-      audio: false,
-    });
+    stream = await openCamera();
   } catch (err) {
     setStatus("Camera access denied: " + err.message, "err");
     return;
   }
+  // Labels are only exposed once permission has been granted, so re-enumerate
+  // now to replace "Camera 1/2" with the real device names.
+  listCameras();
   $("cam").srcObject = stream;
 
   ws = new WebSocket(wsUrl());
@@ -200,7 +287,7 @@ $("stop").addEventListener("click", teardown);
 function teardown() {
   running = false;
   if (ws && ws.readyState === WebSocket.OPEN) ws.close();
-  if (stream) stream.getTracks().forEach((t) => t.stop());
+  stopCamera();
   $("start").disabled = false;
   $("stop").disabled = true;
 }
