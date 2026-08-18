@@ -58,13 +58,34 @@ is obscurity, not access control.
 
 ## Build and push
 
-```bash
-docker build -f deploy/Dockerfile -t <dockerhub-user>/deep-live-cam-stream:latest .
-docker push <dockerhub-user>/deep-live-cam-stream:latest
+The image is ~13 GB, so CI builds it. `.github/workflows/build-image.yml` fires
+on any push touching `deploy/` or `modules/` and pushes to:
+
+```
+ghcr.io/<owner>/deep-live-cam-stream:latest
+ghcr.io/<owner>/deep-live-cam-stream:sha-<commit>
 ```
 
-The image bakes in `inswapper_128.onnx`, `inswapper_128_fp16.onnx`, and
-`buffalo_l`, so a cold pod does no model downloads. Expect ~8-10 GB.
+Nothing that large has to cross your uplink. To build locally anyway:
+
+```bash
+docker build -f deploy/Dockerfile -t deep-live-cam-stream:latest .
+```
+
+The image bakes in `inswapper_128.onnx`, `inswapper_128_fp16.onnx`, `buffalo_l`
+and the opennsfw2 weights, so a cold pod downloads no models.
+
+### Registry visibility
+
+A package built from a private repo is private, and Runpod cannot pull it
+anonymously. Two options:
+
+- **Make the package public** — GitHub → Packages → the package → Package
+  settings → Change visibility. Runpod then pulls with no credentials. Note this
+  publishes a ready-to-run face-swap image under your name.
+- **Keep it private** and give Runpod a registry credential: a GitHub personal
+  access token with `read:packages`, added under Runpod's container registry
+  auth and referenced when creating the pod.
 
 Note on precision: the fp16 model is only selected when `torch.cuda` is
 available, and torch is deliberately not installed (every torch import in

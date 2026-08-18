@@ -55,9 +55,9 @@ print('nsfw stack OK, keras', keras.__version__)"
 # torch.cuda, and torch is deliberately not installed. fp16 is fetched anyway so
 # the image still works if torch is added later.
 RUN mkdir -p /app/models \
-    && curl -fL --retry 3 -o /app/models/inswapper_128.onnx \
+    && curl -fsSL --retry 3 -o /app/models/inswapper_128.onnx \
         "https://huggingface.co/hacksider/deep-live-cam/resolve/main/inswapper_128.onnx?download=true" \
-    && curl -fL --retry 3 -o /app/models/inswapper_128_fp16.onnx \
+    && curl -fsSL --retry 3 -o /app/models/inswapper_128_fp16.onnx \
         "https://huggingface.co/hacksider/deep-live-cam/resolve/main/inswapper_128_fp16.onnx?download=true"
 
 # buffalo_l (detection + recognition + landmarks). Downloaded on CPU providers
