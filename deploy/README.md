@@ -185,6 +185,43 @@ A dropped socket reconnects with backoff, and distinguishes "server still
 loading" from "server gone" by checking `/healthz`, since a page opened during
 startup would otherwise report a connection failure.
 
+## Hair, caps and head shape
+
+`inswapper` preserves them already — it is not a setting. The swap is confined
+to an ellipse in aligned-face space:
+
+```python
+axes = (int(w * 0.44), int(h * 0.44))     # _create_elliptical_mask
+```
+
+Only that region is replaced. Hair, headwear, ears, jawline edges and
+background all come from the target footage. This is exactly why it is *not* a
+head swap: models like BFS replace the entire head including hair, which is the
+opposite behaviour.
+
+Blend controls that genuinely affect the result:
+
+| Control | What it does | Cost |
+|---|---|---|
+| `opacity` | Blend strength against the original face | free |
+| `mouth_mask` | Keeps the real mouth from your footage | small |
+| `sharpness` | Sharpens the swapped region | small |
+| `poisson_blend` | Seamless-clone the edges — best join | **~10-30 ms/frame** |
+| `enable_interpolation` | Blends with the previous frame, reducing flicker | small |
+
+**`color_correction` is not exposed, deliberately.** `apply_color_transfer` is
+defined in `face_swapper.py` but never called from the swap path, so a toggle
+for it would silently do nothing.
+
+### The real gap: occlusion
+
+Nothing here handles something crossing *in front of* the face — a cap brim
+low on the forehead, a hand, a hair strand over the cheek. The elliptical mask
+is geometric, not content-aware, so the swapped face is painted over the
+occluder. Fixing that needs a face-parsing/segmentation model (BiSeNet-class)
+baked in and applied per frame, which is real work and real latency. The eye and
+eyebrow masks in `face_masking.py` are not wired into this pipeline either.
+
 ## Changing face during a stream
 
 Faces are a per-session **library**, not a single slot. Add several images and

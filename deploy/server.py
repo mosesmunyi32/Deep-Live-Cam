@@ -243,8 +243,12 @@ def current_settings():
         "saturation": _adjust["saturation"],
         "many_faces": bool(modules.globals.many_faces),
         "mouth_mask": bool(getattr(modules.globals, "mouth_mask", False)),
+        "mouth_mask_size": float(getattr(modules.globals, "mouth_mask_size", 0.0)),
         "opacity": float(getattr(modules.globals, "opacity", 1.0)),
-        "color_correction": bool(modules.globals.color_correction),
+        "sharpness": float(getattr(modules.globals, "sharpness", 0.0)),
+        "poisson_blend": bool(getattr(modules.globals, "poisson_blend", False)),
+        "enable_interpolation": bool(getattr(modules.globals, "enable_interpolation", False)),
+        "interpolation_weight": float(getattr(modules.globals, "interpolation_weight", 0.2)),
         "nsfw_filter": NSFW_FILTER,
     }
 
@@ -260,8 +264,13 @@ def configure_globals() -> None:
     modules.globals.mouth_mask = _env_flag("DLC_MOUTH_MASK", False)
     modules.globals.nsfw_filter = NSFW_FILTER
     modules.globals.map_faces = False
-    modules.globals.color_correction = True
+    modules.globals.color_correction = True   # read by other processors, not this one
     modules.globals.opacity = 1.0
+    modules.globals.sharpness = 0.0
+    modules.globals.poisson_blend = False
+    modules.globals.enable_interpolation = False
+    modules.globals.interpolation_weight = 0.2
+    modules.globals.mouth_mask_size = 0.0
 
 
 def placeholder_jpeg(text: str) -> bytes:
@@ -616,12 +625,18 @@ async def apply_config(ws: web.WebSocketResponse, body: dict) -> None:
                 _adjust[key] = max(lo, min(hi, float(body[key])))
         if "many_faces" in body:
             modules.globals.many_faces = bool(body["many_faces"])
-        if "mouth_mask" in body:
-            modules.globals.mouth_mask = bool(body["mouth_mask"])
-        if "color_correction" in body:
-            modules.globals.color_correction = bool(body["color_correction"])
-        if "opacity" in body:
-            modules.globals.opacity = max(0.0, min(1.0, float(body["opacity"])))
+        # color_correction is deliberately absent: apply_color_transfer is
+        # defined in face_swapper.py but never called from the swap path, so
+        # exposing it would be a control that silently does nothing.
+        for key in ("mouth_mask", "poisson_blend", "enable_interpolation"):
+            if key in body:
+                setattr(modules.globals, key, bool(body[key]))
+        for key, lo, hi in (("opacity", 0.0, 1.0),
+                            ("sharpness", 0.0, 1.0),
+                            ("interpolation_weight", 0.0, 1.0),
+                            ("mouth_mask_size", 0.0, 100.0)):
+            if key in body:
+                setattr(modules.globals, key, max(lo, min(hi, float(body[key]))))
     except Exception as exc:
         await ws.send_json({"type": "error", "message": f"config rejected: {exc}"})
         return

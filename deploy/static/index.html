@@ -91,9 +91,14 @@
     <input type="range" id="opacity" min="0" max="1" step="0.05" value="1">
     <span id="opacityVal" class="mono">1.00</span>
   </label>
+  <label>Sharpness
+    <input type="range" id="sharpness" min="0" max="1" step="0.05" value="0">
+    <span id="sharpnessVal" class="mono">0.00</span>
+  </label>
   <label><input type="checkbox" id="manyFaces"> All faces</label>
-  <label><input type="checkbox" id="mouthMask"> Mouth mask</label>
-  <label><input type="checkbox" id="colorCorrection" checked> Colour correct</label>
+  <label><input type="checkbox" id="mouthMask" title="Keep the real mouth from your footage"> Keep real mouth</label>
+  <label><input type="checkbox" id="poissonBlend" title="Seamless edge blending — better join, costs ~10-30ms per frame"> Seamless edges <em style="color:var(--muted)">(slower)</em></label>
+  <label><input type="checkbox" id="enableInterpolation" title="Blend with the previous frame to reduce flicker"> Smooth over time</label>
 </div>
 
 <div class="controls">
@@ -472,7 +477,9 @@ function applySettings(st) {
   $("saturation").value = st.saturation; $("saturationVal").textContent = Number(st.saturation).toFixed(2);
   $("manyFaces").checked = st.many_faces;
   $("mouthMask").checked = st.mouth_mask;
-  $("colorCorrection").checked = st.color_correction;
+  $("poissonBlend").checked = st.poisson_blend;
+  $("enableInterpolation").checked = st.enable_interpolation;
+  $("sharpness").value = st.sharpness; $("sharpnessVal").textContent = Number(st.sharpness).toFixed(2);
   $("opacity").value = st.opacity;
   $("opacityVal").textContent = Number(st.opacity).toFixed(2);
 }
@@ -491,7 +498,10 @@ $("model").addEventListener("change", (e) => {
 });
 $("manyFaces").addEventListener("change", (e) => sendConfig({ many_faces: e.target.checked }));
 $("mouthMask").addEventListener("change", (e) => sendConfig({ mouth_mask: e.target.checked }));
-$("colorCorrection").addEventListener("change", (e) => sendConfig({ color_correction: e.target.checked }));
+$("poissonBlend").addEventListener("change", (e) => sendConfig({ poisson_blend: e.target.checked }));
+$("enableInterpolation").addEventListener("change", (e) => sendConfig({ enable_interpolation: e.target.checked }));
+$("sharpness").addEventListener("input", (e) => { $("sharpnessVal").textContent = Number(e.target.value).toFixed(2); });
+$("sharpness").addEventListener("change", (e) => sendConfig({ sharpness: parseFloat(e.target.value) }));
 $("opacity").addEventListener("input", (e) => {
   $("opacityVal").textContent = Number(e.target.value).toFixed(2);
 });
