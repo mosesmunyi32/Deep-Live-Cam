@@ -110,9 +110,12 @@ _last_session_id: Optional[str] = None
 
 # Friendly names for the two variants the image ships with. Anything else
 # dropped into models/ is offered under its filename.
+# Label with the model's actual name, not just its precision: showing only
+# "fp32"/"fp16" hides which model is loaded, which is confusing as soon as a
+# second model exists in the directory.
 KNOWN_LABELS = {
-    "inswapper_128.onnx": "fp32 (default)",
-    "inswapper_128_fp16.onnx": "fp16",
+    "inswapper_128.onnx": "inswapper 128 · fp32 (default)",
+    "inswapper_128_fp16.onnx": "inswapper 128 · fp16 (slow without tensor cores)",
 }
 DEFAULT_MODEL = "inswapper_128.onnx"
 
