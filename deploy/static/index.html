@@ -79,7 +79,7 @@
       <option value="960">960</option>
     </select>
   </label>
-  <button id="start" class="primary">Start</button>
+  <button id="start" class="primary" disabled>Start</button>
   <button id="stop" disabled>Stop</button>
 </div>
 
@@ -125,7 +125,7 @@
   <figure><figcaption>Swapped</figcaption><img id="out" alt="swapped output"></figure>
 </div>
 
-<div id="status">Idle.</div>
+<div id="status">Connecting…</div>
 
 <script>
 const $ = (id) => document.getElementById(id);
@@ -304,33 +304,20 @@ if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
 
 listCameras();
 
-$("start").addEventListener("click", async () => {
-  try {
-    stream = await openCamera();
-  } catch (err) {
-    setStatus("Camera access denied: " + err.message, "err");
-    return;
-  }
-  // Labels are only exposed once permission has been granted, so re-enumerate
-  // now to replace "Camera 1/2" with the real device names.
-  listCameras();
-  buildCameraControls();
-  $("cam").srcObject = stream;
+let reconnectDelay = 1000;
 
+// Connect when the page loads, not when Start is pressed. The model list,
+// settings and face library all arrive over this socket, so opening it late
+// left every control reading "loading…" until the camera was already running -
+// and made it impossible to pick a model or stage faces beforehand.
+function connect() {
   ws = new WebSocket(wsUrl());
   ws.binaryType = "arraybuffer";
 
   ws.onopen = () => {
-    running = true;
-    $("start").disabled = true;
-    $("stop").disabled = false;
-    setStatus("Connected. Waiting for a source face…", "ok");
-    const staged = sessionStorage.getItem("pendingSource");
-    if (staged) {
-      ws.send(JSON.stringify({ type: "source", data: staged }));
-      sessionStorage.removeItem("pendingSource");
-    }
-    pump();
+    reconnectDelay = 1000;
+    $("start").disabled = false;
+    setStatus("Connected — model loaded. Add a face, then press Start.", "ok");
   };
 
   ws.onmessage = (ev) => {
@@ -372,18 +359,62 @@ $("start").addEventListener("click", async () => {
     if (prev.startsWith("blob:")) URL.revokeObjectURL(prev);
   };
 
-  ws.onclose = () => { setStatus("Disconnected.", "err"); teardown(); };
-  ws.onerror = () => setStatus("WebSocket error — check the token and the pod logs.", "err");
+  ws.onclose = () => {
+    stopCamera();
+    running = false;
+    $("start").disabled = true;
+    $("stop").disabled = true;
+    renderFaces([]);   // the library lives server-side, per session
+    // Distinguish "server still warming up" from "server gone": /ws refuses
+    // with 503 until the models finish loading, which otherwise reads as a
+    // connection failure on a page opened during startup.
+    fetch("/healthz").then((r) => r.json()).then((h) => {
+      setStatus(h.status === "initializing"
+        ? "Server is still loading the model…"
+        : `Disconnected — reconnecting in ${(reconnectDelay / 1000).toFixed(0)}s…`,
+        "err");
+    }).catch(() => {
+      setStatus(`Disconnected — reconnecting in ${(reconnectDelay / 1000).toFixed(0)}s…`, "err");
+    });
+    setTimeout(connect, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+  };
+
+  ws.onerror = () => setStatus("WebSocket error — check the token.", "err");
+}
+
+connect();
+
+$("start").addEventListener("click", async () => {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    setStatus("Not connected yet — wait for the server.", "err");
+    return;
+  }
+  try {
+    stream = await openCamera();
+  } catch (err) {
+    setStatus("Camera access denied: " + err.message, "err");
+    return;
+  }
+  // Labels are only exposed once permission has been granted, so re-enumerate
+  // now to replace "Camera 1/2" with the real device names.
+  listCameras();
+  buildCameraControls();
+  $("cam").srcObject = stream;
+  running = true;
+  $("start").disabled = true;
+  $("stop").disabled = false;
+  pump();
 });
 
 $("stop").addEventListener("click", teardown);
 
 function teardown() {
   running = false;
-  if (ws && ws.readyState === WebSocket.OPEN) ws.close();
   stopCamera();
-  $("start").disabled = false;
+  $("start").disabled = !(ws && ws.readyState === WebSocket.OPEN);
   $("stop").disabled = true;
+  setStatus("Stopped — still connected, faces and settings kept.", "ok");
 }
 
 function fillModels(models, settings) {

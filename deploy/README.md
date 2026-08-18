@@ -167,6 +167,24 @@ WebSocket, because the output window is a different client from the one sending
 camera frames. The page reconnects with backoff if the stream drops, so OBS
 recovers on its own across a server restart.
 
+## Startup order
+
+The model is loaded during `on_startup`, which completes **before the listener
+opens** — the log shows `warm-up complete` immediately followed by `listening
+on`. A client therefore cannot connect to a server whose model is not ready;
+`/ws` refuses with 503 and `/healthz` reports `initializing` until it is.
+
+The control page connects its WebSocket on **page load**, not on Start. The
+model list, current settings and face library all arrive over that socket, so
+opening it late left every control showing "loading…" until the camera was
+already running, and made it impossible to choose a model or stage faces
+beforehand. Start now only opens the camera; Stop only closes it, keeping the
+session, its face library and its settings intact.
+
+A dropped socket reconnects with backoff, and distinguishes "server still
+loading" from "server gone" by checking `/healthz`, since a page opened during
+startup would otherwise report a connection failure.
+
 ## Changing face during a stream
 
 Faces are a per-session **library**, not a single slot. Add several images and

@@ -73,7 +73,11 @@ def _env_flag(name: str, default: bool) -> bool:
 PORT = int(os.environ.get("PORT", "8080"))
 AUTH_TOKEN = os.environ.get("DLC_AUTH_TOKEN", "").strip()
 JPEG_QUALITY = int(os.environ.get("DLC_JPEG_QUALITY", "80"))
-MAX_SESSIONS = int(os.environ.get("DLC_MAX_SESSIONS", "2"))
+# Clients now hold a session from page load, not from the first frame, so this
+# counts open tabs rather than active streams. Idle sessions cost no GPU - the
+# single inference thread is what actually serialises work - so the cap is
+# mainly a guard against unbounded face libraries.
+MAX_SESSIONS = int(os.environ.get("DLC_MAX_SESSIONS", "4"))
 MAX_FACES = int(os.environ.get("DLC_MAX_FACES", "12"))
 NSFW_FILTER = _env_flag("DLC_NSFW_FILTER", True)
 
