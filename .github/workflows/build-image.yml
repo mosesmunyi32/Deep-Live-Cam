@@ -9,6 +9,9 @@ on:
     branches: [main, runpod-deploy]
     paths:
       - 'deploy/**'
+      # Docs do not change the image; a ~60 min build per typo is not worth it
+      # on a private repo, where Actions minutes are metered.
+      - '!deploy/**.md'
       - 'modules/**'
       - 'requirements.txt'
       - '.dockerignore'
