@@ -77,15 +77,29 @@ and the opennsfw2 weights, so a cold pod downloads no models.
 
 ### Registry visibility
 
-A package built from a private repo is private, and Runpod cannot pull it
-anonymously. Two options:
+**A public repository does not make its packages public.** They are separate
+settings, and a package pushed by CI starts private regardless of the repo. Only
+the package's visibility decides whether Runpod can pull. Check it directly
+rather than inferring it from the repo:
 
-- **Make the package public** — GitHub → Packages → the package → Package
-  settings → Change visibility. Runpod then pulls with no credentials. Note this
-  publishes a ready-to-run face-swap image under your name.
-- **Keep it private** and give Runpod a registry credential: a GitHub personal
-  access token with `read:packages`, added under Runpod's container registry
-  auth and referenced when creating the pod.
+```bash
+TOK=$(curl -s "https://ghcr.io/token?scope=repository:<owner>/deep-live-cam-stream:pull&service=ghcr.io" \
+      | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])")
+curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $TOK" \
+  https://ghcr.io/v2/<owner>/deep-live-cam-stream/manifests/latest
+```
+
+`200` means anonymous pulls work. `403` means it is private.
+
+Two ways to make the pod able to pull:
+
+- **Make the package public** — <https://github.com/users/OWNER/packages/container/deep-live-cam-stream/settings>
+  → Change visibility → Public. No credential needed, and `--registry-auth-id`
+  can be dropped from the deploy command. This publishes a ready-to-run
+  face-swap image under your name.
+- **Keep it private** and register a credential: a GitHub PAT with
+  `read:packages` via `runpodctl registry create`, passed as
+  `--registry-auth-id`. See Deploy below.
 
 Note on precision: the runtime uses fp32, because upstream gates the fp16 model
 behind `torch.cuda` and torch is deliberately not installed. Do not "fix" that
@@ -227,7 +241,7 @@ runpodctl stop pod <pod-id>
 
 Upstream is **AGPL-3.0**. Section 13 means that if you let other people use this
 over a network, you must offer them the corresponding source, including your
-changes. Keeping this repository public is the simplest way to satisfy that.
+changes. This repository is public, which satisfies that directly.
 
 Deep-Live-Cam's own terms require consent from anyone whose likeness you use.
 `DLC_NSFW_FILTER` defaults to on here — upstream's CLI defaults it off — and the
