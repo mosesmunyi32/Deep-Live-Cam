@@ -29,3 +29,7 @@ switch_states.json
 install.bat
 /.claude
 *.bat
+
+# TLS material for local HTTPS - never commit private keys
+deploy/certs/
+*.pem

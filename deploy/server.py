@@ -75,6 +75,9 @@ JPEG_QUALITY = int(os.environ.get("DLC_JPEG_QUALITY", "80"))
 MAX_SESSIONS = int(os.environ.get("DLC_MAX_SESSIONS", "2"))
 NSFW_FILTER = _env_flag("DLC_NSFW_FILTER", True)
 
+TLS_CERT = os.environ.get("DLC_TLS_CERT", "").strip()
+TLS_KEY = os.environ.get("DLC_TLS_KEY", "").strip()
+
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 MODELS_DIR = os.path.join(ROOT_DIR, "models")
 
@@ -509,6 +512,26 @@ def build_app() -> web.Application:
     return app
 
 
+def build_ssl_context():
+    """Optional TLS.
+
+    Browsers only expose getUserMedia in a secure context. localhost counts, so
+    same-machine use needs nothing; a phone on the LAN reaches this by IP and
+    does not, hence the option. On Runpod the proxy already terminates TLS, so
+    leave this unset there.
+    """
+    if not (TLS_CERT and TLS_KEY):
+        return None
+    import ssl
+
+    for path in (TLS_CERT, TLS_KEY):
+        if not os.path.exists(path):
+            raise SystemExit(f"TLS enabled but {path} does not exist")
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(TLS_CERT, TLS_KEY)
+    return ctx
+
+
 def main() -> None:
     logging.basicConfig(
         level=os.environ.get("DLC_LOG_LEVEL", "INFO").upper(),
@@ -525,10 +548,12 @@ def main() -> None:
         raise SystemExit(1)
 
     configure_globals()
-    _LOG.info("starting on :%d (nsfw_filter=%s max_sessions=%d models=%s)",
-              PORT, NSFW_FILTER, MAX_SESSIONS,
+    ssl_ctx = build_ssl_context()
+    _LOG.info("starting on :%d (%s nsfw_filter=%s max_sessions=%d models=%s)",
+              PORT, "https" if ssl_ctx else "http", NSFW_FILTER, MAX_SESSIONS,
               ",".join(m["id"] for m in available_models()))
-    web.run_app(build_app(), host="0.0.0.0", port=PORT, access_log=None)
+    web.run_app(build_app(), host="0.0.0.0", port=PORT,
+                ssl_context=ssl_ctx, access_log=None)
 
 
 if __name__ == "__main__":

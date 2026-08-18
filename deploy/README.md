@@ -40,6 +40,52 @@ browser ──getUserMedia──▶ canvas ──JPEG──▶ WebSocket ──�
 A single worker thread serializes GPU access; a one-slot mailbox (`LatestSlot`)
 drops stale frames so latency stays bounded when inference falls behind.
 
+## Using a phone as the camera
+
+The control page uses `getUserMedia`, so any device that can open the page can
+be the camera — including a phone. Browsers only expose `getUserMedia` in a
+**secure context**, which is the whole difficulty:
+
+| Where | Secure context? | What is needed |
+|---|---|---|
+| `localhost` on this machine | yes (localhost is exempt) | nothing |
+| **Runpod proxy URL** | yes, HTTPS already | **nothing — just open it on the phone** |
+| `http://<lan-ip>:8080` from a phone | no | TLS, below |
+
+On Runpod this is free: open the pod URL in Safari or Chrome on the phone, pick
+the camera, and it streams. No companion app, no virtual-camera bridge.
+
+For local testing, generate a self-signed certificate and enable TLS:
+
+```bash
+./deploy/make-cert.sh 192.168.1.146       # your LAN IP
+
+docker run ... \
+  -e DLC_TLS_CERT=/app/deploy/certs/cert.pem \
+  -e DLC_TLS_KEY=/app/deploy/certs/key.pem \
+  -v "$PWD/deploy:/app/deploy:ro" ...
+```
+
+Then browse to `https://192.168.1.146:8080/?token=…` and accept the warning.
+
+Two things the script handles that hand-rolled certs usually miss: iOS ignores
+Common Name entirely and requires the address in **subjectAltName**, and it
+rejects certificates valid for more than **825 days**. If Safari still refuses
+the camera after accepting the warning, install the cert properly — mail
+`cert.pem` to yourself, open it, Settings → *Profile Downloaded* → Install, then
+Settings → General → About → **Certificate Trust Settings** and enable full
+trust for it.
+
+`deploy/certs/` is gitignored. Do not commit private keys.
+
+An alternative that avoids certificate warnings altogether is a tunnel with a
+real certificate — `cloudflared tunnel --url http://localhost:8080` or a
+Tailscale funnel — at the cost of routing your video through a third party.
+
+Bridging apps (Iriun, DroidCam) also work: they present the phone as a
+`/dev/video*` device that appears in the camera selector. That adds an encode
+and decode hop for no benefit over just opening the page on the phone.
+
 ## Choosing the camera
 
 The control page lists every `videoinput` device and passes the chosen one to
