@@ -87,17 +87,16 @@ anonymously. Two options:
   access token with `read:packages`, added under Runpod's container registry
   auth and referenced when creating the pod.
 
-Note on precision: the fp16 model is only selected when `torch.cuda` is
-available, and torch is deliberately not installed (every torch import in
-`modules/` is guarded). The runtime therefore uses fp32 — fine for a 128×128
-model. Add torch to `requirements-server.txt` if you want the fp16 path.
+Note on precision: the runtime uses fp32, because upstream gates the fp16 model
+behind `torch.cuda` and torch is deliberately not installed. Do not "fix" that
+by adding torch — see the fp16 measurement under GPU sizing first.
 
 ## Deploy
 
 ```bash
 runpodctl create pod \
   --name deep-live-cam \
-  --imageName <dockerhub-user>/deep-live-cam-stream:latest \
+  --imageName ghcr.io/<owner>/deep-live-cam-stream:latest \
   --gpuType "NVIDIA RTX A5000" \
   --gpuCount 1 \
   --containerDiskSize 25 \
@@ -120,9 +119,49 @@ until curl -sf https://<pod-id>-8080.proxy.runpod.net/healthz; do sleep 5; done
 
 ### GPU sizing
 
-`inswapper_128` is small; detection dominates. An RTX A4000/A5000 comfortably
-holds 25-30 fps at 640×480 for one face. Scale up for `DLC_MANY_FACES=1` or
-several concurrent sessions.
+Measured with `deploy/bench.py` on a Quadro T1000 Max-Q, fp32, 640 px:
+
+| stage | p50 |
+|---|---|
+| detect | 48.6 ms |
+| swap (inference) | 135.3 ms |
+| post-processing | 0.8 ms |
+| **total** | **185.7 ms — 5.4 fps** |
+
+End-to-end through the WebSocket measured 183 ms, so JPEG encode/decode and the
+socket cost nothing measurable. Throughput is bound entirely by `inswapper`
+inference, which is GPU-bound and so scales with the card. A T1000 Max-Q is
+about 2.6 TFLOPS fp32; an A5000 is roughly ten times that, which should put a
+single stream near 30-40 fps. Verify on the pod rather than trusting the
+extrapolation:
+
+```bash
+python deploy/bench.py --frames 100 --width 640
+```
+
+Note what this rules out: detection is not the bottleneck, post-processing is
+free, and the transport is free. If a stream is slow, the swap model is the
+only thing worth attacking.
+
+### fp16 — measure, do not assume
+
+`bench.py --fp16` forces the fp16 model without installing torch. On the T1000
+it was **6x slower** (841 ms vs 135 ms): that die is TU117, the one Turing part
+with no tensor cores, so fp16 runs as emulation plus cast overhead. On an
+Ampere card with real tensor cores it may well win. Run the flag on the
+deployment GPU before enabling it in the server.
+
+### Local GPU testing
+
+If `--gpus all` fails with `nvidia-cuda-mps-control: no such file or directory`,
+that is a host toolkit quirk, not the image. Use the runtime directly:
+
+```bash
+docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all \
+  -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+  -v "$PWD/media:/app/media:ro" deep-live-cam-stream:latest \
+  python deploy/bench.py
+```
 
 ### Cost
 
