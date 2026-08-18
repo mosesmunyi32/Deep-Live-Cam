@@ -5,12 +5,22 @@ Runpod does not route UDP (TCP/HTTP only), so the usual WebRTC media path is
 unavailable on this platform; a TCP frame stream is the transport that actually
 works here. See deploy/README.md for the latency trade-off.
 
-Protocol
---------
+Endpoints
+---------
+    GET  /                    control UI
+    GET  /output              output-only view (pop-out window / OBS source)
+    GET  /stream.mjpg         MJPEG of the swapped output
+    GET  /models              available swapper models and current settings
+    GET  /healthz             503 until models are loaded, then 200
+    WS   /ws                  the streaming session
+
+Session protocol
+----------------
     client -> server   TEXT    {"type": "source", "data": "<base64 jpeg>"}
+    client -> server   TEXT    {"type": "config", ...}
     client -> server   BINARY  a JPEG frame from the webcam
     server -> client   BINARY  the swapped JPEG frame
-    server -> client   TEXT    {"type": "status"|"error", ...}
+    server -> client   TEXT    {"type": "status"|"error"|"hello", ...}
 
 The server keeps only the newest inbound frame per session: if inference falls
 behind the camera, stale frames are dropped rather than queued, which is what
@@ -22,10 +32,12 @@ import base64
 import json
 import logging
 import os
+import secrets
 import sys
+import threading
 import types
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from typing import Dict, Optional
 
 import cv2
 import numpy as np
@@ -45,7 +57,8 @@ _ui_stub.check_and_ignore_nsfw = lambda target, destroy=None: False
 _ui_stub.init = lambda *args, **kwargs: None
 sys.modules["modules.ui"] = _ui_stub
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT_DIR)
 
 import modules.globals  # noqa: E402
 import modules.processors.frame.face_swapper as face_swapper  # noqa: E402
@@ -61,18 +74,87 @@ AUTH_TOKEN = os.environ.get("DLC_AUTH_TOKEN", "").strip()
 JPEG_QUALITY = int(os.environ.get("DLC_JPEG_QUALITY", "80"))
 MAX_SESSIONS = int(os.environ.get("DLC_MAX_SESSIONS", "2"))
 NSFW_FILTER = _env_flag("DLC_NSFW_FILTER", True)
-MANY_FACES = _env_flag("DLC_MANY_FACES", False)
-MOUTH_MASK = _env_flag("DLC_MOUTH_MASK", False)
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+MODELS_DIR = os.path.join(ROOT_DIR, "models")
 
 # One worker: a single GPU serializes inference anyway, and a single thread
 # keeps frame latency predictable instead of letting requests interleave.
 EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="swap")
 
 _ready = False
-_active_sessions = 0
+_sessions: Dict[str, "Session"] = {}
 _sessions_lock = asyncio.Lock()
+_last_session_id: Optional[str] = None
+
+
+# --- Model selection ----------------------------------------------------------
+# Both inswapper variants are baked into the image. Upstream picks between them
+# with a torch.cuda probe; torch is not installed, so the choice is driven here.
+
+PRECISIONS = {
+    "fp32": "inswapper_128.onnx",
+    "fp16": "inswapper_128_fp16.onnx",
+}
+_model_lock = threading.Lock()
+_current_precision = "fp32"
+
+
+def available_models():
+    out = []
+    for pid, fname in PRECISIONS.items():
+        path = os.path.join(MODELS_DIR, fname)
+        if os.path.exists(path):
+            out.append({
+                "id": pid,
+                "file": fname,
+                "size_mb": round(os.path.getsize(path) / 1e6),
+            })
+    return out
+
+
+def set_precision(precision: str) -> str:
+    """Switch the inswapper variant. Global — it affects every session."""
+    global _current_precision
+    if precision not in PRECISIONS:
+        raise ValueError(f"unknown precision {precision!r}")
+    if not os.path.exists(os.path.join(MODELS_DIR, PRECISIONS[precision])):
+        raise ValueError(f"{PRECISIONS[precision]} is not present in the image")
+
+    with _model_lock:
+        if precision == _current_precision:
+            return _current_precision
+
+        # Upstream gates fp16 on torch.cuda purely as a "is there a usable GPU"
+        # probe. onnxruntime already answered that, so drive the gate directly
+        # rather than installing ~2.5 GB of torch to satisfy it.
+        face_swapper._HAS_TORCH_CUDA = (precision == "fp16")
+        face_swapper.FACE_SWAPPER = None
+
+        # The CUDA graph is recorded against one model's input/output buffers.
+        # Carrying it across a model change would replay the previous model.
+        face_swapper._cuda_graph_session.update(
+            session=None, io_binding=None, ort_input=None,
+            ort_latent=None, recorded=False,
+        )
+        face_swapper.FACE_DETECTION_CACHE.clear()
+        face_swapper.FRAME_CACHE.clear()
+
+        face_swapper.get_face_swapper()   # load now, not on the next frame
+        _current_precision = precision
+        _LOG.info("swapper precision -> %s (%s)", precision, PRECISIONS[precision])
+        return _current_precision
+
+
+def current_settings():
+    return {
+        "precision": _current_precision,
+        "many_faces": bool(modules.globals.many_faces),
+        "mouth_mask": bool(getattr(modules.globals, "mouth_mask", False)),
+        "opacity": float(getattr(modules.globals, "opacity", 1.0)),
+        "color_correction": bool(modules.globals.color_correction),
+        "nsfw_filter": NSFW_FILTER,
+    }
 
 
 # --- Inference ----------------------------------------------------------------
@@ -82,11 +164,20 @@ def configure_globals() -> None:
     modules.globals.frame_processors = ["face_swapper"]
     modules.globals.execution_providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
     modules.globals.headless = True
-    modules.globals.many_faces = MANY_FACES
-    modules.globals.mouth_mask = MOUTH_MASK
+    modules.globals.many_faces = _env_flag("DLC_MANY_FACES", False)
+    modules.globals.mouth_mask = _env_flag("DLC_MOUTH_MASK", False)
     modules.globals.nsfw_filter = NSFW_FILTER
     modules.globals.map_faces = False
     modules.globals.color_correction = True
+    modules.globals.opacity = 1.0
+
+
+def placeholder_jpeg(text: str) -> bytes:
+    """A frame for output views to show before any real frame exists."""
+    img = np.zeros((360, 640, 3), dtype=np.uint8)
+    cv2.putText(img, text, (40, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                (110, 110, 110), 2, cv2.LINE_AA)
+    return cv2.imencode(".jpg", img)[1].tobytes()
 
 
 def warm_up() -> None:
@@ -97,18 +188,15 @@ def warm_up() -> None:
     """
     if not face_swapper.pre_start():
         raise RuntimeError(
-            "face_swapper.pre_start() failed - the inswapper model is missing from "
-            f"{modules.globals.__dict__.get('models_dir', 'models/')}. "
+            f"face_swapper.pre_start() failed - no inswapper model in {MODELS_DIR}. "
             "The image should have baked it in; check the Dockerfile download step."
         )
-    dummy = np.zeros((480, 640, 3), dtype=np.uint8)
-    face_swapper.process_frame(None, dummy)
+    face_swapper.process_frame(None, np.zeros((480, 640, 3), dtype=np.uint8))
     _LOG.info("warm-up complete")
 
 
 def decode_jpeg(payload: bytes) -> Optional[np.ndarray]:
-    frame = cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_COLOR)
-    return frame
+    return cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_COLOR)
 
 
 def swap_jpeg(source_face, payload: bytes) -> Optional[bytes]:
@@ -130,8 +218,7 @@ def is_nsfw(frame: np.ndarray) -> bool:
         from PIL import Image
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        score = opennsfw2.predict_image(Image.fromarray(rgb))
-        return bool(score > 0.85)
+        return bool(opennsfw2.predict_image(Image.fromarray(rgb)) > 0.85)
     except Exception as exc:  # never let the screen fail open silently
         _LOG.warning("NSFW screen errored, rejecting the upload: %s", exc)
         return True
@@ -157,11 +244,39 @@ class LatestSlot:
         return item
 
 
+class Broadcast:
+    """Fans the newest swapped frame out to output views and OBS.
+
+    Separate from the session socket because an output window is a different
+    client from the one sending camera frames.
+    """
+
+    def __init__(self, initial: bytes) -> None:
+        self._frame = initial
+        self._seq = 0
+        self._cond = asyncio.Condition()
+
+    async def publish(self, jpeg: bytes) -> None:
+        async with self._cond:
+            self._frame = jpeg
+            self._seq += 1
+            self._cond.notify_all()
+
+    async def get_since(self, seq: int):
+        async with self._cond:
+            await self._cond.wait_for(lambda: self._seq != seq)
+            return self._frame, self._seq
+
+    def snapshot(self):
+        return self._frame, self._seq
+
+
 class Session:
-    def __init__(self) -> None:
+    def __init__(self, sid: str) -> None:
+        self.id = sid
         self.source_face = None
         self.slot = LatestSlot()
-        self.dropped = 0
+        self.broadcast = Broadcast(placeholder_jpeg("waiting for stream"))
 
 
 def authorized(request: web.Request) -> bool:
@@ -171,7 +286,21 @@ def authorized(request: web.Request) -> bool:
     header = request.headers.get("Authorization", "")
     if header.startswith("Bearer "):
         supplied = header[len("Bearer "):]
-    return supplied == AUTH_TOKEN
+    return secrets.compare_digest(supplied, AUTH_TOKEN)
+
+
+def resolve_session(request: web.Request) -> Optional["Session"]:
+    """Pick the session an output view should follow.
+
+    An explicit ?s= wins; otherwise fall back to the most recent session so
+    that pointing OBS at /output with just a token does the obvious thing.
+    """
+    sid = request.query.get("s")
+    if sid:
+        return _sessions.get(sid)
+    if _last_session_id:
+        return _sessions.get(_last_session_id)
+    return None
 
 
 # --- Handlers -----------------------------------------------------------------
@@ -180,11 +309,61 @@ async def handle_index(request: web.Request) -> web.StreamResponse:
     return web.FileResponse(os.path.join(STATIC_DIR, "index.html"))
 
 
+async def handle_output(request: web.Request) -> web.StreamResponse:
+    return web.FileResponse(os.path.join(STATIC_DIR, "output.html"))
+
+
 async def handle_health(request: web.Request) -> web.Response:
     """Readiness, not liveness: 503 until the models are actually loaded."""
     if not _ready:
         return web.json_response({"status": "initializing"}, status=503)
-    return web.json_response({"status": "ready", "sessions": _active_sessions})
+    return web.json_response({"status": "ready", "sessions": len(_sessions)})
+
+
+async def handle_models(request: web.Request) -> web.Response:
+    if not authorized(request):
+        return web.json_response({"error": "unauthorized"}, status=401)
+    return web.json_response({
+        "models": available_models(),
+        "settings": current_settings(),
+    })
+
+
+async def handle_mjpeg(request: web.Request) -> web.StreamResponse:
+    """multipart/x-mixed-replace — an <img> or OBS browser source consumes this."""
+    if not authorized(request):
+        return web.json_response({"error": "unauthorized"}, status=401)
+
+    resp = web.StreamResponse(status=200, headers={
+        "Content-Type": "multipart/x-mixed-replace; boundary=dlcframe",
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Connection": "close",
+    })
+    await resp.prepare(request)
+
+    session = resolve_session(request)
+    idle = Broadcast(placeholder_jpeg("no active session"))
+    source = session.broadcast if session else idle
+    frame, seq = source.snapshot()
+
+    try:
+        while True:
+            await resp.write(
+                b"--dlcframe\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                + str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n"
+            )
+            # Re-resolve each iteration so an output window opened before the
+            # session started latches on once frames begin.
+            session = resolve_session(request) or session
+            source = session.broadcast if session else idle
+            try:
+                frame, seq = await asyncio.wait_for(source.get_since(seq), timeout=2.0)
+            except asyncio.TimeoutError:
+                frame, seq = source.snapshot()   # keep-alive re-send
+    except (asyncio.CancelledError, ConnectionResetError, ConnectionError):
+        pass
+    return resp
 
 
 async def process_loop(ws: web.WebSocketResponse, session: Session) -> None:
@@ -200,33 +379,41 @@ async def process_loop(ws: web.WebSocketResponse, session: Session) -> None:
             _LOG.exception("swap failed")
             await ws.send_json({"type": "error", "message": f"swap failed: {exc}"})
             continue
-        if out is not None and not ws.closed:
-            await ws.send_bytes(out)
+        if out is not None:
+            await session.broadcast.publish(out)
+            if not ws.closed:
+                await ws.send_bytes(out)
 
 
 async def handle_ws(request: web.Request) -> web.StreamResponse:
-    global _active_sessions
+    global _last_session_id
 
     if not authorized(request):
         return web.json_response({"error": "unauthorized"}, status=401)
     if not _ready:
         return web.json_response({"error": "server still initializing"}, status=503)
 
+    sid = secrets.token_hex(4)
     async with _sessions_lock:
-        if _active_sessions >= MAX_SESSIONS:
+        if len(_sessions) >= MAX_SESSIONS:
             return web.json_response(
-                {"error": f"at capacity ({MAX_SESSIONS} sessions)"}, status=429
-            )
-        _active_sessions += 1
+                {"error": f"at capacity ({MAX_SESSIONS} sessions)"}, status=429)
+        session = Session(sid)
+        _sessions[sid] = session
+        _last_session_id = sid
 
     ws = web.WebSocketResponse(max_msg_size=16 * 1024 * 1024, heartbeat=20)
     await ws.prepare(request)
-    session = Session()
     consumer = asyncio.create_task(process_loop(ws, session))
-    _LOG.info("session opened (%d/%d)", _active_sessions, MAX_SESSIONS)
+    _LOG.info("session %s opened (%d/%d)", sid, len(_sessions), MAX_SESSIONS)
 
     try:
-        await ws.send_json({"type": "status", "message": "connected"})
+        await ws.send_json({
+            "type": "hello",
+            "session": sid,
+            "models": available_models(),
+            "settings": current_settings(),
+        })
         async for msg in ws:
             if msg.type == WSMsgType.BINARY:
                 session.slot.put(msg.data)
@@ -236,16 +423,41 @@ async def handle_ws(request: web.Request) -> web.StreamResponse:
                 except json.JSONDecodeError:
                     await ws.send_json({"type": "error", "message": "malformed json"})
                     continue
-                if body.get("type") == "source":
+                kind = body.get("type")
+                if kind == "source":
                     await set_source(ws, session, body.get("data", ""))
+                elif kind == "config":
+                    await apply_config(ws, body)
             elif msg.type == WSMsgType.ERROR:
                 _LOG.warning("ws error: %s", ws.exception())
     finally:
         consumer.cancel()
         async with _sessions_lock:
-            _active_sessions -= 1
-        _LOG.info("session closed")
+            _sessions.pop(sid, None)
+        _LOG.info("session %s closed", sid)
     return ws
+
+
+async def apply_config(ws: web.WebSocketResponse, body: dict) -> None:
+    """Apply settings. These are process-wide, so they affect every session."""
+    loop = asyncio.get_running_loop()
+    try:
+        if "precision" in body:
+            # Model reload is blocking and touches the GPU: keep it on the
+            # inference thread so it cannot overlap a swap in flight.
+            await loop.run_in_executor(EXECUTOR, set_precision, body["precision"])
+        if "many_faces" in body:
+            modules.globals.many_faces = bool(body["many_faces"])
+        if "mouth_mask" in body:
+            modules.globals.mouth_mask = bool(body["mouth_mask"])
+        if "color_correction" in body:
+            modules.globals.color_correction = bool(body["color_correction"])
+        if "opacity" in body:
+            modules.globals.opacity = max(0.0, min(1.0, float(body["opacity"])))
+    except Exception as exc:
+        await ws.send_json({"type": "error", "message": f"config rejected: {exc}"})
+        return
+    await ws.send_json({"type": "settings", "settings": current_settings()})
 
 
 async def set_source(ws: web.WebSocketResponse, session: Session, data_b64: str) -> None:
@@ -273,21 +485,23 @@ async def set_source(ws: web.WebSocketResponse, session: Session, data_b64: str)
 
     session.source_face = face
     await ws.send_json({"type": "status", "message": "source face set"})
-    _LOG.info("source face set for session")
+    _LOG.info("source face set for session %s", session.id)
 
 
 # --- Entrypoint ---------------------------------------------------------------
 
 async def on_startup(app: web.Application) -> None:
     global _ready
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(EXECUTOR, warm_up)
+    await asyncio.get_running_loop().run_in_executor(EXECUTOR, warm_up)
     _ready = True
 
 
 def build_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/", handle_index)
+    app.router.add_get("/output", handle_output)
+    app.router.add_get("/stream.mjpg", handle_mjpeg)
+    app.router.add_get("/models", handle_models)
     app.router.add_get("/healthz", handle_health)
     app.router.add_get("/ws", handle_ws)
     app.router.add_static("/static/", STATIC_DIR)
@@ -311,10 +525,9 @@ def main() -> None:
         raise SystemExit(1)
 
     configure_globals()
-    _LOG.info(
-        "starting on :%d (nsfw_filter=%s many_faces=%s max_sessions=%d)",
-        PORT, NSFW_FILTER, MANY_FACES, MAX_SESSIONS,
-    )
+    _LOG.info("starting on :%d (nsfw_filter=%s max_sessions=%d models=%s)",
+              PORT, NSFW_FILTER, MAX_SESSIONS,
+              ",".join(m["id"] for m in available_models()))
     web.run_app(build_app(), host="0.0.0.0", port=PORT, access_log=None)
 
 

@@ -40,6 +40,60 @@ browser ──getUserMedia──▶ canvas ──JPEG──▶ WebSocket ──�
 A single worker thread serializes GPU access; a one-slot mailbox (`LatestSlot`)
 drops stale frames so latency stays bounded when inference falls behind.
 
+## Output view and OBS
+
+The control page at `/` is for driving the swap. The swapped frames are also
+published separately, so the output can live in its own window or go straight
+into OBS without the surrounding UI:
+
+| Path | What it is |
+|---|---|
+| `/output?token=…&s=<session>` | Output-only page — black background, frame scaled to fit |
+| `/output?token=…&s=<session>&bare=1` | Same, with the error strip suppressed. Use this for OBS |
+| `/stream.mjpg?token=…&s=<session>` | Raw `multipart/x-mixed-replace` MJPEG |
+
+**OBS:** Sources → **+** → **Browser** → paste the `bare=1` URL, set 960×540,
+and uncheck *Shutdown source when not visible* so it keeps streaming while you
+are on another scene. The control page's **Copy OBS browser-source URL** button
+produces exactly this URL with the token and session filled in.
+
+`s` selects which session to mirror. Omit it and the output follows the most
+recent session, which is what you want with a single streamer; it matters only
+when `DLC_MAX_SESSIONS` is above 1.
+
+A separate `<img>` consuming MJPEG is used rather than reusing the session
+WebSocket, because the output window is a different client from the one sending
+camera frames. The page reconnects with backoff if the stream drops, so OBS
+recovers on its own across a server restart.
+
+## Choosing the model
+
+The control page's **Model** selector switches between the two baked inswapper
+variants at runtime; `GET /models` lists what the image actually contains.
+
+Switching is **process-wide, not per-session** — these are module-level globals
+in the upstream processor, so a change affects every connected client. The same
+applies to the *All faces*, *Mouth mask*, *Colour correct* and *Opacity*
+controls.
+
+The switch invalidates the recorded CUDA graph as well as the cached session.
+That matters: the graph is recorded against one model's input and output
+buffers, so reusing it after a model change would silently keep replaying the
+previous model.
+
+Measured through the running server on the T1000:
+
+| model | end-to-end p50 |
+|---|---|
+| fp32 `inswapper_128.onnx` | 181 ms |
+| fp16 `inswapper_128_fp16.onnx` | 881 ms |
+
+fp16 loses badly here because TU117 has no tensor cores — see the fp16 note
+under GPU sizing. Try the selector on the deployment GPU before assuming either
+way. The face enhancers upstream offers (`face_enhancer`, GPEN 256/512) are not
+selectable because their weights are not baked into the image, and at their cost
+per frame they are not realistic for a live stream anyway.
+
 ## Configuration
 
 | Env var | Default | Meaning |

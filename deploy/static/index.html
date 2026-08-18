@@ -36,7 +36,12 @@
   #status { margin-top: 14px; color: var(--muted); font-variant-numeric: tabular-nums; }
   #status.err { color: var(--bad); }
   #status.ok { color: var(--ok); }
-  label { color: var(--muted); }
+  label { color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
+  .mono { font-family: ui-monospace, monospace; color: var(--fg); }
+  .hint { color: var(--muted); font-size: 12px; flex: 1 1 260px; }
+  .hint b { color: var(--fg); }
+  input[type=range] { accent-color: var(--accent); }
+  input[type=checkbox] { accent-color: var(--accent); }
 </style>
 </head>
 <body>
@@ -65,6 +70,25 @@
   <button id="stop" disabled>Stop</button>
 </div>
 
+<div class="controls">
+  <label>Model
+    <select id="model"><option value="fp32">loading…</option></select>
+  </label>
+  <label>Opacity
+    <input type="range" id="opacity" min="0" max="1" step="0.05" value="1">
+    <span id="opacityVal" class="mono">1.00</span>
+  </label>
+  <label><input type="checkbox" id="manyFaces"> All faces</label>
+  <label><input type="checkbox" id="mouthMask"> Mouth mask</label>
+  <label><input type="checkbox" id="colorCorrection" checked> Colour correct</label>
+</div>
+
+<div class="controls">
+  <button id="popout">Open output window</button>
+  <button id="copyObs">Copy OBS browser-source URL</button>
+  <span id="obsHint" class="hint">OBS → Sources → + → <b>Browser</b> → paste URL, 960×540, uncheck "Shutdown source when not visible".</span>
+</div>
+
 <div class="stage">
   <figure><figcaption>Camera</figcaption><video id="cam" autoplay playsinline muted></video></figure>
   <figure><figcaption>Swapped</figcaption><img id="out" alt="swapped output"></figure>
@@ -78,7 +102,7 @@ const statusEl = $("status");
 const token = new URLSearchParams(location.search).get("token") || "";
 
 let ws = null, stream = null, running = false;
-let inFlight = false, sourceReady = false;
+let inFlight = false, sourceReady = false, sessionId = "";
 let frames = 0, lastTick = performance.now(), lastLatency = 0, sentAt = 0;
 const canvas = document.createElement("canvas");
 const ctx = canvas.getContext("2d", { willReadFrequently: false });
@@ -142,11 +166,17 @@ $("start").addEventListener("click", async () => {
   ws.onmessage = (ev) => {
     if (typeof ev.data === "string") {
       const body = JSON.parse(ev.data);
-      if (body.type === "error") setStatus("Error: " + body.message, "err");
-      else {
-        if (body.message === "source face set") sourceReady = true;
-        setStatus(body.message, "ok");
+      if (body.type === "error") { setStatus("Error: " + body.message, "err"); return; }
+      if (body.type === "hello") {
+        sessionId = body.session || "";
+        fillModels(body.models, body.settings);
+        applySettings(body.settings);
+        setStatus(`Connected (session ${sessionId}). Choose a source face…`, "ok");
+        return;
       }
+      if (body.type === "settings") { applySettings(body.settings); return; }
+      if (body.message === "source face set") sourceReady = true;
+      setStatus(body.message, "ok");
       return;
     }
     // Binary: a swapped frame.
@@ -174,6 +204,71 @@ function teardown() {
   $("start").disabled = false;
   $("stop").disabled = true;
 }
+
+function fillModels(models, settings) {
+  const sel = $("model");
+  sel.innerHTML = "";
+  (models || []).forEach((m) => {
+    const o = document.createElement("option");
+    o.value = m.id;
+    o.textContent = `${m.id} — ${m.file} (${m.size_mb} MB)`;
+    sel.appendChild(o);
+  });
+  if (settings) sel.value = settings.precision;
+}
+
+function applySettings(st) {
+  if (!st) return;
+  $("model").value = st.precision;
+  $("manyFaces").checked = st.many_faces;
+  $("mouthMask").checked = st.mouth_mask;
+  $("colorCorrection").checked = st.color_correction;
+  $("opacity").value = st.opacity;
+  $("opacityVal").textContent = Number(st.opacity).toFixed(2);
+}
+
+function sendConfig(patch) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(Object.assign({ type: "config" }, patch)));
+  } else {
+    setStatus("Connect first — settings apply to the running server.", "err");
+  }
+}
+
+$("model").addEventListener("change", (e) => {
+  setStatus(`Loading ${e.target.value} model…`);
+  sendConfig({ precision: e.target.value });
+});
+$("manyFaces").addEventListener("change", (e) => sendConfig({ many_faces: e.target.checked }));
+$("mouthMask").addEventListener("change", (e) => sendConfig({ mouth_mask: e.target.checked }));
+$("colorCorrection").addEventListener("change", (e) => sendConfig({ color_correction: e.target.checked }));
+$("opacity").addEventListener("input", (e) => {
+  $("opacityVal").textContent = Number(e.target.value).toFixed(2);
+});
+$("opacity").addEventListener("change", (e) => sendConfig({ opacity: parseFloat(e.target.value) }));
+
+function outputUrl(bare) {
+  const q = new URLSearchParams();
+  if (token) q.set("token", token);
+  if (sessionId) q.set("s", sessionId);
+  if (bare) q.set("bare", "1");
+  return `${location.origin}/output?${q.toString()}`;
+}
+
+$("popout").addEventListener("click", () => {
+  window.open(outputUrl(false), "dlc-output", "width=980,height=580");
+});
+
+$("copyObs").addEventListener("click", async () => {
+  const url = outputUrl(true);
+  try {
+    await navigator.clipboard.writeText(url);
+    setStatus("OBS URL copied to clipboard.", "ok");
+  } catch {
+    // Clipboard needs a secure context and permission; fall back to showing it.
+    window.prompt("Copy this into an OBS Browser source:", url);
+  }
+});
 
 function pump() {
   const video = $("cam");

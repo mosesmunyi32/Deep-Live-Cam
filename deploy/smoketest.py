@@ -45,6 +45,8 @@ async def main():
     ap.add_argument("--url", default="http://127.0.0.1:8080")
     ap.add_argument("--token", required=True)
     ap.add_argument("--frames", type=int, default=20)
+    ap.add_argument("--precision", choices=["fp32", "fp16"],
+                    help="switch the swapper model before measuring")
     args = ap.parse_args()
 
     import aiohttp
@@ -73,7 +75,8 @@ async def main():
         ws_url = f"{args.url.replace('http', 'ws')}/ws?token={args.token}"
         async with sess.ws_connect(ws_url, max_msg_size=16 * 1024 * 1024) as ws:
             msg = await ws.receive_json()
-            print(f"connected: {msg}")
+            print(f"connected: session={msg.get('session')} "
+                  f"models={[m['id'] for m in msg.get('models', [])]}")
 
             await ws.send_json({"type": "source",
                                 "data": base64.b64encode(source).decode()})
@@ -82,6 +85,22 @@ async def main():
             if msg.get("type") != "status":
                 print("FAIL: source face was rejected")
                 return 1
+
+            if args.precision:
+                await ws.send_json({"type": "config", "precision": args.precision})
+                msg = await asyncio.wait_for(ws.receive_json(), timeout=120)
+                if msg.get("type") != "settings":
+                    print(f"FAIL: model switch rejected: {msg}")
+                    return 1
+                got = msg["settings"]["precision"]
+                if got != args.precision:
+                    print(f"FAIL: asked for {args.precision}, server reports {got}")
+                    return 1
+                print(f"model switched -> {got}")
+                # Reloaded model pays autotuning on its first frames; burn a few.
+                for warm in targets[:3]:
+                    await ws.send_bytes(warm)
+                    await asyncio.wait_for(ws.receive(), timeout=60)
 
             lat = []
             got = 0
