@@ -117,7 +117,7 @@ runpodctl pod create \
   --name deep-live-cam \
   --image ghcr.io/<owner>/deep-live-cam-stream:latest \
   --registry-auth-id <id-from-registry-list> \
-  --gpu-id "NVIDIA RTX A5000" \
+  --gpu-id "NVIDIA A40" \
   --gpu-count 1 \
   --container-disk-in-gb 40 \
   --ports "8080/http" \
@@ -160,9 +160,9 @@ Measured with `deploy/bench.py` on a Quadro T1000 Max-Q, fp32, 640 px:
 End-to-end through the WebSocket measured 183 ms, so JPEG encode/decode and the
 socket cost nothing measurable. Throughput is bound entirely by `inswapper`
 inference, which is GPU-bound and so scales with the card. A T1000 Max-Q is
-about 2.6 TFLOPS fp32; an A5000 is roughly ten times that, which should put a
-single stream near 30-40 fps. Verify on the pod rather than trusting the
-extrapolation:
+about 2.6 TFLOPS fp32. An A40 is roughly fourteen times that, which should put
+a single stream comfortably past 30 fps. Verify on the pod rather than trusting
+the extrapolation:
 
 ```bash
 python deploy/bench.py --frames 100 --width 640
@@ -171,6 +171,27 @@ python deploy/bench.py --frames 100 --width 640
 Note what this rules out: detection is not the bottleneck, post-processing is
 free, and the transport is free. If a stream is slow, the swap model is the
 only thing worth attacking.
+
+#### Which GPU
+
+`inswapper_128` needs about 2 GB of VRAM, so memory is never the constraint —
+compute is. Live prices and stock from `runpodctl gpu list`:
+
+| GPU | VRAM | $/hr | stock | vs T1000 |
+|---|---|---|---|---|
+| **A40** | 48G | **0.44** | High | ~14x |
+| RTX A6000 | 48G | 0.53 | Low | ~15x |
+| RTX 3090 | 24G | 0.50 | Low | ~14x |
+| RTX 4090 | 24G | 0.74 | High | ~32x |
+| RTX 4000 Ada | 20G | 0.28 | Low | ~10x |
+
+The A40 is the default here: cheapest card with **High** stock, and already far
+more than one stream needs. Reach for a 4090 only for several concurrent
+sessions or `DLC_MANY_FACES=1`. Anything marked Low stock may simply fail to
+provision.
+
+Do not size on VRAM — a 48 GB A40 and a 24 GB 3090 perform about the same here,
+because the model is tiny and the work is compute-bound.
 
 ### fp16 — measure, do not assume
 
@@ -194,8 +215,9 @@ docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all \
 
 ### Cost
 
-A pod bills continuously while it exists — there is no scale-to-zero. Stop it
-when idle:
+A pod bills continuously while it exists — there is no scale-to-zero. At the
+A40's $0.44/hr that is about **$10.50 a day, or $315 a month**, whether or not
+anyone is streaming. Stop it when idle:
 
 ```bash
 runpodctl stop pod <pod-id>
