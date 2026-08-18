@@ -76,6 +76,9 @@ def main():
     ap.add_argument("--frames", type=int, default=100)
     ap.add_argument("--width", type=int, default=640)
     ap.add_argument("--provider", choices=["cuda", "cpu"], default="cuda")
+    ap.add_argument("--no-color-correction", action="store_true")
+    ap.add_argument("--fp16", action="store_true",
+                    help="force the fp16 swapper without installing torch")
     args = ap.parse_args()
 
     providers = (
@@ -88,7 +91,7 @@ def main():
     modules.globals.headless = True
     modules.globals.many_faces = False
     modules.globals.map_faces = False
-    modules.globals.color_correction = True
+    modules.globals.color_correction = not args.no_color_correction
 
     import onnxruntime as ort
 
@@ -99,6 +102,13 @@ def main():
     media = os.path.join(ROOT, "media")
     gifs = [os.path.join(media, n) for n in
             ("demo.gif", "live_show.gif", "streamers.gif", "ludwig.gif", "movie.gif")]
+
+    if args.fp16:
+        # Upstream gates fp16 on torch.cuda purely as a "is there a usable GPU"
+        # probe. onnxruntime already answered that, so satisfy the gate directly
+        # rather than adding ~2.5 GB of torch to the image.
+        face_swapper._HAS_TORCH_CUDA = True
+        print("fp16: forced on")
 
     print("\nloading models…")
     t0 = time.perf_counter()
@@ -135,7 +145,7 @@ def main():
     for _ in range(5):
         face_swapper.process_frame(src_face, targets[0])
 
-    detect_ms, swap_ms, total_ms = [], [], []
+    detect_ms, raw_ms, swap_ms, total_ms = [], [], [], []
     print(f"benchmarking {args.frames} frames…")
     for i in range(args.frames):
         frame = targets[i % len(targets)]
@@ -144,11 +154,18 @@ def main():
         target_face = get_one_face(frame)
         d = (time.perf_counter() - t) * 1000
 
+        # Pure model inference, no post-processing.
+        t = time.perf_counter()
+        face_swapper.swap_face(src_face, target_face, frame.copy())
+        r = (time.perf_counter() - t) * 1000
+
+        # Same swap plus masking / colour transfer / blending.
         t = time.perf_counter()
         face_swapper.process_frame(src_face, frame, target_face=target_face)
         s = (time.perf_counter() - t) * 1000
 
         detect_ms.append(d)
+        raw_ms.append(r)
         swap_ms.append(s)
         total_ms.append(d + s)
 
@@ -159,7 +176,10 @@ def main():
     print(f"\n--- {args.width}px, {args.provider} ---")
     print("  stage        p50 (ms)      p95 (ms)      max (ms)")
     row("detect", detect_ms)
-    row("swap", swap_ms)
+    row("swap:raw", raw_ms)
+    row("swap:full", swap_ms)
+    post = [f - r for f, r in zip(swap_ms, raw_ms)]
+    row("post-proc", post)
     row("total", total_ms)
     med = statistics.median(total_ms)
     print(f"\n  sustained: {1000 / med:.1f} fps  ({med:.1f} ms/frame)")
