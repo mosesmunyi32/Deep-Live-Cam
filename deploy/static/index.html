@@ -134,7 +134,7 @@ const token = new URLSearchParams(location.search).get("token") || "";
 
 let ws = null, stream = null, running = false;
 let inFlight = false, sourceReady = false, sessionId = "", obsBase = "";
-let frames = 0, lastTick = performance.now(), lastLatency = 0, sentAt = 0;
+let frames = 0, lastTick = performance.now(), lastLatency = 0, sentAt = 0, lastNagAt = 0;
 const canvas = document.createElement("canvas");
 const ctx = canvas.getContext("2d", { willReadFrequently: false });
 
@@ -148,25 +148,49 @@ function wsUrl() {
   return `${proto}//${location.host}/ws${token ? "?token=" + encodeURIComponent(token) : ""}`;
 }
 
+// The library lives server-side and is per-session, so a refresh or a dropped
+// socket empties it. Keep the images client-side too and re-upload on connect,
+// otherwise a reload silently leaves the stream with no face and no swap.
+let myFaces = [];
+try { myFaces = JSON.parse(sessionStorage.getItem("faces") || "[]"); } catch { myFaces = []; }
+
+function rememberFaces() {
+  try { sessionStorage.setItem("faces", JSON.stringify(myFaces)); }
+  catch { /* quota - keep them in memory for this page at least */ }
+}
+
+// Downscale before upload: a modern phone photo is several MB, all of it
+// discarded by a detector that works on a 640px frame.
+async function toDataURL(file, max = 640) {
+  const bmp = await createImageBitmap(file);
+  const scale = Math.min(1, max / Math.max(bmp.width, bmp.height));
+  const c = document.createElement("canvas");
+  c.width = Math.round(bmp.width * scale);
+  c.height = Math.round(bmp.height * scale);
+  c.getContext("2d").drawImage(bmp, 0, 0, c.width, c.height);
+  bmp.close();
+  return c.toDataURL("image/jpeg", 0.85);
+}
+
+function uploadFace(entry) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "source", data: entry.data, label: entry.label }));
+  }
+}
+
 $("srcFile").addEventListener("change", async (ev) => {
   const files = Array.from(ev.target.files || []);
+  ev.target.value = "";   // allow re-adding the same file later
   if (!files.length) return;
   for (const file of files) {
-    const b64 = await new Promise((res) => {
-      const r = new FileReader();
-      r.onload = () => res(r.result);
-      r.readAsDataURL(file);
-    });
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "source", data: b64,
-                               label: file.name.replace(/\.[^.]+$/, "").slice(0, 24) }));
-    } else {
-      sessionStorage.setItem("pendingSource", b64);
-      setStatus("Face staged — press Start.");
-      break;
-    }
+    let data;
+    try { data = await toDataURL(file); }
+    catch (err) { setStatus(`Could not read ${file.name}: ${err.message}`, "err"); continue; }
+    const entry = { data, label: file.name.replace(/\.[^.]+$/, "").slice(0, 24) };
+    myFaces.push(entry);
+    uploadFace(entry);
   }
-  ev.target.value = "";   // allow re-adding the same file later
+  rememberFaces();
 });
 
 let faceIds = [];
@@ -202,6 +226,8 @@ function renderFaces(faces) {
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: "drop_face", id: f.id }));
       }
+      myFaces = myFaces.filter((m) => m.label !== f.label);
+      rememberFaces();
     });
     el.appendChild(del);
     box.appendChild(el);
@@ -326,6 +352,10 @@ function connect() {
       if (body.type === "error") { setStatus("Error: " + body.message, "err"); return; }
       if (body.type === "hello") {
         sessionId = body.session || "";
+        if (myFaces.length) {
+          setStatus(`Restoring ${myFaces.length} face(s)…`);
+          myFaces.forEach(uploadFace);
+        }
         obsBase = body.obs_base || "";
         if (obsBase) {
           $("obsHint").innerHTML =
@@ -405,6 +435,11 @@ $("start").addEventListener("click", async () => {
   $("start").disabled = true;
   $("stop").disabled = false;
   pump();
+  if (!sourceReady) {
+    // The pump deliberately sends nothing without a face. Saying so beats
+    // showing a live camera next to a permanently blank output pane.
+    setStatus("Camera running — now add a face above. Nothing is swapped until one is set.", "err");
+  }
 });
 
 $("stop").addEventListener("click", teardown);
@@ -596,7 +631,14 @@ function pump() {
 
     // Only one frame in flight at a time. This paces the sender to whatever the
     // GPU can actually keep up with, instead of queueing frames in the socket.
-    if (inFlight || !sourceReady) return;
+    if (!sourceReady) {
+      if (now - lastNagAt > 3000) {
+        lastNagAt = now;
+        setStatus("No source face — add one above to start swapping.", "err");
+      }
+      return;
+    }
+    if (inFlight) return;
     if (now - last < interval) return;
     if (!video.videoWidth) return;
     last = now;
