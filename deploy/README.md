@@ -167,6 +167,32 @@ WebSocket, because the output window is a different client from the one sending
 camera frames. The page reconnects with backoff if the stream drops, so OBS
 recovers on its own across a server restart.
 
+## Changing face during a stream
+
+Faces are a per-session **library**, not a single slot. Add several images and
+switch between them by clicking a thumbnail or pressing number keys `1`-`9`.
+
+Switching costs **0.3 ms** measured, because the expensive part — detecting and
+embedding the face — happens once at upload. Changing the active face after
+that is a dictionary lookup, so it does not interrupt the stream or drop a
+frame. `DLC_MAX_FACES` caps the library, default 12.
+
+Every uploaded image goes through the NSFW screen and face detection
+independently, so an image with no detectable face is rejected at upload rather
+than silently producing unswapped frames later.
+
+## Which model for live streaming
+
+`inswapper` — and in practice nothing else. It is one forward pass of a small
+128x128 network, which is what makes ~30 fps achievable on a mid-range GPU.
+
+Diffusion-based swappers (BFS, and anything built on FLUX, Qwen-Image-Edit or
+Krea) produce visibly better single images and **cannot stream at all**: they
+run 20-50 denoising steps through a multi-billion-parameter transformer, which
+is seconds per frame against a ~33 ms budget. That gap is architectural, not a
+tuning problem. They are worth using for stills and offline video; they are not
+an option for live.
+
 ## Adding models
 
 `GET /models` lists **every `.onnx` in `models/`**, so adding one is a file

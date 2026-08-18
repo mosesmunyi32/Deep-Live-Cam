@@ -45,6 +45,12 @@
   .rowlabel { color: var(--fg); font-weight: 600; flex-basis: 100%; }
   .rowlabel em { color: var(--muted); font-weight: 400; font-style: normal; font-size: 12px; }
   .camctl { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; color: var(--muted); }
+  .faces { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-start; color: var(--muted); }
+  .face { position: relative; border: 2px solid var(--line); border-radius: 8px; padding: 0; cursor: pointer; background: #0d1117; line-height: 0; }
+  .face.active { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(47,129,247,.3); }
+  .face img { width: 72px; height: 72px; object-fit: cover; border-radius: 6px; display: block; }
+  .face .idx { position: absolute; top: 2px; left: 4px; font: 11px ui-monospace, monospace; color: #fff; text-shadow: 0 0 3px #000; }
+  .face .del { position: absolute; top: -6px; right: -6px; background: var(--bad); color: #fff; border: none; border-radius: 50%; width: 18px; height: 18px; font-size: 11px; line-height: 1; cursor: pointer; padding: 0; }
 </style>
 </head>
 <body>
@@ -53,7 +59,7 @@
 <div class="sub">Frames are sent to the GPU pod over a WebSocket and returned swapped.</div>
 
 <div class="controls">
-  <label>Source face <input type="file" id="srcFile" accept="image/*"></label>
+  <label>Add face(s) <input type="file" id="srcFile" accept="image/*" multiple></label>
   <label>Camera
     <select id="camera"><option value="">default</option></select>
   </label>
@@ -88,6 +94,11 @@
   <label><input type="checkbox" id="manyFaces"> All faces</label>
   <label><input type="checkbox" id="mouthMask"> Mouth mask</label>
   <label><input type="checkbox" id="colorCorrection" checked> Colour correct</label>
+</div>
+
+<div class="controls">
+  <span class="rowlabel">Face library <em>(click to switch instantly — number keys 1-9 also work)</em></span>
+  <div id="faces" class="faces">No faces yet — add one or more images above.</div>
 </div>
 
 <div class="controls">
@@ -138,19 +149,73 @@ function wsUrl() {
 }
 
 $("srcFile").addEventListener("change", async (ev) => {
-  const file = ev.target.files[0];
-  if (!file) return;
-  const b64 = await new Promise((res) => {
-    const r = new FileReader();
-    r.onload = () => res(r.result);
-    r.readAsDataURL(file);
+  const files = Array.from(ev.target.files || []);
+  if (!files.length) return;
+  for (const file of files) {
+    const b64 = await new Promise((res) => {
+      const r = new FileReader();
+      r.onload = () => res(r.result);
+      r.readAsDataURL(file);
+    });
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "source", data: b64,
+                               label: file.name.replace(/\.[^.]+$/, "").slice(0, 24) }));
+    } else {
+      sessionStorage.setItem("pendingSource", b64);
+      setStatus("Face staged — press Start.");
+      break;
+    }
+  }
+  ev.target.value = "";   // allow re-adding the same file later
+});
+
+let faceIds = [];
+
+function renderFaces(faces) {
+  const box = $("faces");
+  faceIds = faces.map((f) => f.id);
+  if (!faces.length) {
+    box.textContent = "No faces yet — add one or more images above.";
+    sourceReady = false;
+    return;
+  }
+  sourceReady = faces.some((f) => f.active);
+  box.innerHTML = "";
+  faces.forEach((f, i) => {
+    const el = document.createElement("div");
+    el.className = "face" + (f.active ? " active" : "");
+    el.title = f.label;
+    el.innerHTML =
+      `<img src="${f.thumb}" alt="${f.label}">` +
+      `<span class="idx">${i + 1}</span>`;
+    el.addEventListener("click", () => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "use_face", id: f.id }));
+      }
+    });
+    const del = document.createElement("button");
+    del.className = "del";
+    del.textContent = "×";
+    del.title = "remove";
+    del.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "drop_face", id: f.id }));
+      }
+    });
+    el.appendChild(del);
+    box.appendChild(el);
   });
+}
+
+// Number keys switch faces without touching the mouse - the point of the
+// library is changing face mid-stream without fumbling.
+document.addEventListener("keydown", (e) => {
+  if (e.target.matches("input, select, textarea")) return;
+  const n = parseInt(e.key, 10);
+  if (!n || n < 1 || n > faceIds.length) return;
   if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: "source", data: b64 }));
-    setStatus("Uploading source face…");
-  } else {
-    sessionStorage.setItem("pendingSource", b64);
-    setStatus("Source staged — press Start.");
+    ws.send(JSON.stringify({ type: "use_face", id: faceIds[n - 1] }));
   }
 });
 
@@ -287,7 +352,11 @@ $("start").addEventListener("click", async () => {
         return;
       }
       if (body.type === "settings") { applySettings(body.settings); return; }
-      if (body.message === "source face set") sourceReady = true;
+      if (body.type === "faces") {
+        renderFaces(body.faces);
+        if (body.message) setStatus(body.message, "ok");
+        return;
+      }
       setStatus(body.message, "ok");
       return;
     }

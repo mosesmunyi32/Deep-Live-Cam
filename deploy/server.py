@@ -74,6 +74,7 @@ PORT = int(os.environ.get("PORT", "8080"))
 AUTH_TOKEN = os.environ.get("DLC_AUTH_TOKEN", "").strip()
 JPEG_QUALITY = int(os.environ.get("DLC_JPEG_QUALITY", "80"))
 MAX_SESSIONS = int(os.environ.get("DLC_MAX_SESSIONS", "2"))
+MAX_FACES = int(os.environ.get("DLC_MAX_FACES", "12"))
 NSFW_FILTER = _env_flag("DLC_NSFW_FILTER", True)
 
 TLS_CERT = os.environ.get("DLC_TLS_CERT", "").strip()
@@ -359,7 +360,11 @@ class Broadcast:
 class Session:
     def __init__(self, sid: str) -> None:
         self.id = sid
-        self.source_face = None
+        # A library, not one face. Analysis is the expensive part, so faces are
+        # embedded once on upload and switching afterwards is a dict lookup -
+        # which is what makes changing face mid-stream instant.
+        self.faces: Dict[str, dict] = {}
+        self.active_face_id: Optional[str] = None
         self.slot = LatestSlot()
         self.broadcast = Broadcast(placeholder_jpeg("waiting for stream"))
         # Counters exist to answer "is the client actually sending frames?".
@@ -368,6 +373,16 @@ class Session:
         self.frames_out = 0
         self.bytes_in = 0
         self.last_frame_at = 0.0
+
+    @property
+    def source_face(self):
+        entry = self.faces.get(self.active_face_id or "")
+        return entry["face"] if entry else None
+
+    def face_list(self):
+        return [{"id": fid, "label": e["label"], "thumb": e["thumb"],
+                 "active": fid == self.active_face_id}
+                for fid, e in self.faces.items()]
 
 
 def authorized(request: web.Request) -> bool:
@@ -557,7 +572,12 @@ async def handle_ws(request: web.Request) -> web.StreamResponse:
                     continue
                 kind = body.get("type")
                 if kind == "source":
-                    await set_source(ws, session, body.get("data", ""))
+                    await set_source(ws, session, body.get("data", ""),
+                                     body.get("label", ""))
+                elif kind == "use_face":
+                    await use_face(ws, session, body.get("id", ""))
+                elif kind == "drop_face":
+                    await drop_face(ws, session, body.get("id", ""))
                 elif kind == "config":
                     await apply_config(ws, body)
             elif msg.type == WSMsgType.ERROR:
@@ -601,8 +621,20 @@ async def apply_config(ws: web.WebSocketResponse, body: dict) -> None:
     await ws.send_json({"type": "settings", "settings": current_settings()})
 
 
-async def set_source(ws: web.WebSocketResponse, session: Session, data_b64: str) -> None:
-    """Accept, screen, and analyse the source face for this session."""
+def make_thumb(frame: np.ndarray, size: int = 96) -> str:
+    """Small data-URI preview so the client can render the library."""
+    h, w = frame.shape[:2]
+    scale = size / max(h, w)
+    small = cv2.resize(frame, (max(1, int(w * scale)), max(1, int(h * scale))))
+    ok, enc = cv2.imencode(".jpg", small, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+    if not ok:
+        return ""
+    return "data:image/jpeg;base64," + base64.b64encode(enc.tobytes()).decode()
+
+
+async def set_source(ws: web.WebSocketResponse, session: Session,
+                     data_b64: str, label: str = "") -> None:
+    """Screen and analyse a face, add it to the session library, make it active."""
     loop = asyncio.get_running_loop()
     try:
         raw = base64.b64decode(data_b64.split(",")[-1])
@@ -624,9 +656,40 @@ async def set_source(ws: web.WebSocketResponse, session: Session, data_b64: str)
         await ws.send_json({"type": "error", "message": "no face found in the source image"})
         return
 
-    session.source_face = face
-    await ws.send_json({"type": "status", "message": "source face set"})
-    _LOG.info("source face set for session %s", session.id)
+    if len(session.faces) >= MAX_FACES:
+        await ws.send_json({"type": "error",
+                            "message": f"face library is full ({MAX_FACES})"})
+        return
+
+    fid = secrets.token_hex(3)
+    session.faces[fid] = {
+        "face": face,
+        "label": label or f"face {len(session.faces) + 1}",
+        "thumb": make_thumb(frame),
+    }
+    session.active_face_id = fid
+    await ws.send_json({"type": "faces", "faces": session.face_list(),
+                        "message": "source face set"})
+    _LOG.info("session %s: face %s added (%d in library)",
+              session.id, fid, len(session.faces))
+
+
+async def use_face(ws: web.WebSocketResponse, session: Session, fid: str) -> None:
+    """Switch the active face. No GPU work - the embedding already exists."""
+    if fid not in session.faces:
+        await ws.send_json({"type": "error", "message": f"no such face {fid}"})
+        return
+    session.active_face_id = fid
+    await ws.send_json({"type": "faces", "faces": session.face_list(),
+                        "message": f"switched to {session.faces[fid]['label']}"})
+
+
+async def drop_face(ws: web.WebSocketResponse, session: Session, fid: str) -> None:
+    session.faces.pop(fid, None)
+    if session.active_face_id == fid:
+        session.active_face_id = next(iter(session.faces), None)
+    await ws.send_json({"type": "faces", "faces": session.face_list(),
+                        "message": "face removed"})
 
 
 # --- Entrypoint ---------------------------------------------------------------
