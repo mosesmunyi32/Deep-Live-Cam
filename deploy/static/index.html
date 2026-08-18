@@ -102,6 +102,13 @@
 </div>
 
 <div class="controls">
+  <span class="rowlabel">Mode</span>
+  <label><input type="radio" name="mode" id="modeSwap" value="swap" checked> <b>Face swap</b> — keeps <em>your</em> hair and head</label>
+  <label><input type="radio" name="mode" id="modePortrait" value="portrait"> <b>Portrait</b> — uses the <em>chosen image's</em> hair and head</label>
+  <span id="modeHint" class="hint"></span>
+</div>
+
+<div class="controls">
   <span class="rowlabel">Face library <em>(click to switch instantly — number keys 1-9 also work)</em></span>
   <div id="faces" class="faces">No faces yet — add one or more images above.</div>
 </div>
@@ -472,6 +479,17 @@ function fillModels(models, settings) {
 function applySettings(st) {
   if (!st) return;
   $("model").value = st.model;
+  if (st.mode) {
+    $(st.mode === "portrait" ? "modePortrait" : "modeSwap").checked = true;
+    $("modeHint").textContent = st.mode === "portrait"
+      ? "Output is the chosen picture animated by your camera — its background too."
+      : "Output is your camera with the face replaced.";
+  }
+  if (st.liveportrait && !st.liveportrait.available) {
+    $("modePortrait").disabled = true;
+    $("modeHint").textContent = "Portrait mode unavailable: " +
+      (st.liveportrait.missing || []).join(", ");
+  }
   $("brightness").value = st.brightness; $("brightnessVal").textContent = st.brightness;
   $("contrast").value = st.contrast; $("contrastVal").textContent = Number(st.contrast).toFixed(2);
   $("saturation").value = st.saturation; $("saturationVal").textContent = Number(st.saturation).toFixed(2);
@@ -491,6 +509,14 @@ function sendConfig(patch) {
     setStatus("Connect first — settings apply to the running server.", "err");
   }
 }
+
+[["modeSwap", "swap"], ["modePortrait", "portrait"]].forEach(([id, value]) => {
+  $(id).addEventListener("change", (e) => {
+    if (!e.target.checked) return;
+    setStatus(value === "portrait" ? "Preparing portrait mode…" : "Switching to face swap…");
+    sendConfig({ mode: value });
+  });
+});
 
 $("model").addEventListener("change", (e) => {
   setStatus(`Loading ${e.target.value}…`);

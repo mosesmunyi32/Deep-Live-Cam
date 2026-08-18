@@ -9,3 +9,6 @@ models/*.onnx
 models/*.pth
 **/__pycache__
 *.pyc
+
+# LivePortrait weights are baked by the Dockerfile, not shipped in the context
+models/liveportrait/

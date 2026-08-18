@@ -60,6 +60,19 @@ RUN mkdir -p /app/models \
     && curl -fsSL --retry 3 -o /app/models/inswapper_128_fp16.onnx \
         "https://huggingface.co/hacksider/deep-live-cam/resolve/main/inswapper_128_fp16.onnx?download=true"
 
+# LivePortrait ONNX weights for portrait mode. Same reasoning as above: baked in
+# so a cold pod downloads nothing. warping_spade-fix is the corrected export and
+# is what deploy/liveportrait/configs/onnx_infer.yaml points at.
+RUN mkdir -p /app/models/liveportrait \
+    && for f in appearance_feature_extractor.onnx motion_extractor.onnx \
+                warping_spade-fix.onnx stitching.onnx stitching_eye.onnx \
+                stitching_lip.onnx landmark.onnx retinaface_det_static.onnx \
+                face_2dpose_106_static.onnx; do \
+         curl -fsSL --retry 3 -o "/app/models/liveportrait/$f" \
+           "https://huggingface.co/warmshao/FasterLivePortrait/resolve/main/liveportrait_onnx/$f" \
+           || exit 1; \
+       done
+
 # buffalo_l (detection + recognition + landmarks). Downloaded on CPU providers
 # because the build host has no GPU; it lands in ~/.insightface, which is where
 # modules/face_analyser.py looks for it at runtime.
@@ -76,6 +89,18 @@ import onnxruntime as ort; \
 ps = ort.get_available_providers(); \
 print('providers:', ps); \
 assert 'CUDAExecutionProvider' in ps, 'onnxruntime-gpu has no CUDA provider'"
+
+# Fail the build, not the pod, if the vendored pipeline cannot even import or a
+# weight is missing. No GPU here, so this checks wiring only, not inference.
+RUN python -c "\
+import sys; sys.path.insert(0, '/app/deploy'); \
+from lp_engine import ENGINE, missing_weights; \
+m = missing_weights(); \
+assert not m, f'LivePortrait weights missing: {m}'; \
+sys.path.insert(0, '/app/deploy/liveportrait'); \
+from omegaconf import OmegaConf; \
+from src.pipelines.faster_live_portrait_pipeline import FasterLivePortraitPipeline; \
+print('liveportrait import OK, weights present')"
 
 ENV PORT=8080
 EXPOSE 8080

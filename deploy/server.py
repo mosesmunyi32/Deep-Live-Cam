@@ -60,10 +60,12 @@ sys.modules["modules.ui"] = _ui_stub
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT_DIR)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import modules.globals  # noqa: E402
 import modules.processors.frame.face_swapper as face_swapper  # noqa: E402
 from modules.face_analyser import get_one_face  # noqa: E402
+from lp_engine import ENGINE as LP  # noqa: E402
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -125,6 +127,11 @@ DEFAULT_MODEL = "inswapper_128.onnx"
 
 _model_lock = threading.Lock()
 _current_model = DEFAULT_MODEL
+
+# "swap"     - inswapper: keeps the driver's head and hair, replaces the face.
+# "portrait" - LivePortrait: animates the chosen portrait, so the output has
+#              *that image's* hair, head and background, driven by the camera.
+_mode = "swap"
 
 
 def available_models():
@@ -237,6 +244,8 @@ def adjust_frame(frame: np.ndarray) -> np.ndarray:
 
 def current_settings():
     return {
+        "mode": _mode,
+        "liveportrait": LP.status(),
         "model": _current_model,
         "brightness": _adjust["brightness"],
         "contrast": _adjust["contrast"],
@@ -272,6 +281,12 @@ def configure_globals() -> None:
     modules.globals.interpolation_weight = 0.2
     modules.globals.mouth_mask_size = 0.0
 
+    # torch is installed for LivePortrait, and face_swapper gates its fp16 model
+    # on torch.cuda. Left alone, adding torch silently switches the swapper to
+    # fp16 - measured 5x slower on a GPU without tensor cores. Pin the gate off
+    # so the model is chosen here, not by a side effect of another feature.
+    face_swapper._HAS_TORCH_CUDA = False
+
 
 def placeholder_jpeg(text: str) -> bytes:
     """A frame for output views to show before any real frame exists."""
@@ -300,15 +315,26 @@ def decode_jpeg(payload: bytes) -> Optional[np.ndarray]:
     return cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_COLOR)
 
 
-def swap_jpeg(source_face, payload: bytes) -> Optional[bytes]:
-    """Decode -> swap -> re-encode. Runs on EXECUTOR, never the event loop."""
+def encode(frame: np.ndarray) -> Optional[bytes]:
+    ok, enc = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+    return enc.tobytes() if ok else None
+
+
+def process_jpeg(entry: dict, payload: bytes, first: bool = False) -> Optional[bytes]:
+    """Decode -> swap or animate -> re-encode. Runs on EXECUTOR, not the loop."""
     frame = decode_jpeg(payload)
     if frame is None:
         return None
     frame = adjust_frame(frame)
-    swapped = face_swapper.process_frame(source_face, frame)
-    ok, encoded = cv2.imencode(".jpg", swapped, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
-    return encoded.tobytes() if ok else None
+
+    if _mode == "portrait":
+        source = entry.get("lp")
+        if source is None:
+            return None
+        out = LP.animate(frame, source, first_frame=first)
+        return encode(out) if out is not None else None
+
+    return encode(face_swapper.process_frame(entry["face"], frame))
 
 
 def is_nsfw(frame: np.ndarray) -> bool:
@@ -390,9 +416,14 @@ class Session:
         self.bytes_in = 0
         self.last_frame_at = 0.0
 
+        self.first_frame = True
+
+    def active_entry(self):
+        return self.faces.get(self.active_face_id or "")
+
     @property
     def source_face(self):
-        entry = self.faces.get(self.active_face_id or "")
+        entry = self.active_entry()
         return entry["face"] if entry else None
 
     def face_list(self):
@@ -520,8 +551,16 @@ async def process_loop(ws: web.WebSocketResponse, session: Session) -> None:
         if session.source_face is None:
             await ws.send_json({"type": "error", "message": "no source face set"})
             continue
+        if _mode == "portrait" and session.active_entry().get("lp") is None:
+            await ws.send_json({"type": "error",
+                                "message": "this face has no portrait source - re-select it"})
+            continue
         try:
-            out = await loop.run_in_executor(EXECUTOR, swap_jpeg, session.source_face, payload)
+            entry = session.active_entry()
+            if entry is None:
+                continue
+            first, session.first_frame = session.first_frame, False
+            out = await loop.run_in_executor(EXECUTOR, process_jpeg, entry, payload, first)
         except Exception as exc:
             _LOG.exception("swap failed")
             await ws.send_json({"type": "error", "message": f"swap failed: {exc}"})
@@ -614,6 +653,8 @@ async def apply_config(ws: web.WebSocketResponse, body: dict) -> None:
     """Apply settings. These are process-wide, so they affect every session."""
     loop = asyncio.get_running_loop()
     try:
+        if "mode" in body:
+            await set_mode(ws, body["mode"])
         if "model" in body:
             # Model reload is blocking and touches the GPU: keep it on the
             # inference thread so it cannot overlap a swap in flight.
@@ -654,6 +695,31 @@ def make_thumb(frame: np.ndarray, size: int = 96) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(enc.tobytes()).decode()
 
 
+async def set_mode(ws: web.WebSocketResponse, mode: str) -> None:
+    global _mode
+    if mode not in ("swap", "portrait"):
+        raise ValueError(f"unknown mode {mode!r}")
+    if mode == "portrait" and not LP.available():
+        raise ValueError(f"LivePortrait weights missing: {missing_or_none()}")
+    if mode == _mode:
+        return
+    _mode = mode
+    LP.reset()
+    _LOG.info("mode -> %s", mode)
+    # Prepare the active face for every live session, so switching mode does not
+    # produce a stall on the next frame instead of a picture.
+    for sess in list(_sessions.values()):
+        if sess.active_face_id:
+            if mode == "portrait":
+                await ensure_portrait_source(ws, sess, sess.active_face_id)
+            sess.first_frame = True
+
+
+def missing_or_none():
+    from lp_engine import missing_weights
+    return missing_weights()
+
+
 async def set_source(ws: web.WebSocketResponse, session: Session,
                      data_b64: str, label: str = "") -> None:
     """Screen and analyse a face, add it to the session library, make it active."""
@@ -686,10 +752,15 @@ async def set_source(ws: web.WebSocketResponse, session: Session,
     fid = secrets.token_hex(3)
     session.faces[fid] = {
         "face": face,
+        "image": frame,          # kept for portrait mode, which needs the picture
+        "lp": None,              # prepared lazily, only if portrait mode is used
         "label": label or f"face {len(session.faces) + 1}",
         "thumb": make_thumb(frame),
     }
     session.active_face_id = fid
+    session.first_frame = True
+    if _mode == "portrait":
+        await ensure_portrait_source(ws, session, fid)
     await ws.send_json({"type": "faces", "faces": session.face_list(),
                         "message": "source face set"})
     _LOG.info("session %s: face %s added (%d in library)",
@@ -702,8 +773,33 @@ async def use_face(ws: web.WebSocketResponse, session: Session, fid: str) -> Non
         await ws.send_json({"type": "error", "message": f"no such face {fid}"})
         return
     session.active_face_id = fid
+    session.first_frame = True
+    if _mode == "portrait":
+        await ensure_portrait_source(ws, session, fid)
     await ws.send_json({"type": "faces", "faces": session.face_list(),
                         "message": f"switched to {session.faces[fid]['label']}"})
+
+
+async def ensure_portrait_source(ws: web.WebSocketResponse, session: Session, fid: str) -> bool:
+    """Prepare a face for portrait mode. Expensive, so done once and cached."""
+    entry = session.faces.get(fid)
+    if entry is None or entry.get("lp") is not None:
+        return entry is not None
+    loop = asyncio.get_running_loop()
+    await ws.send_json({"type": "status", "message": "preparing portrait…"})
+    try:
+        src = await loop.run_in_executor(EXECUTOR, LP.prepare_source, entry["image"])
+    except Exception as exc:
+        _LOG.exception("portrait prepare failed")
+        await ws.send_json({"type": "error", "message": f"portrait prepare failed: {exc}"})
+        return False
+    if src is None:
+        await ws.send_json({"type": "error",
+                            "message": f"no usable face in {entry['label']} for portrait mode"})
+        return False
+    entry["lp"] = src
+    session.first_frame = True
+    return True
 
 
 async def drop_face(ws: web.WebSocketResponse, session: Session, fid: str) -> None:

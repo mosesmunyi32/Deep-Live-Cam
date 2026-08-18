@@ -4,8 +4,14 @@
 #   - PySide6         : desktop GUI only; the server stubs modules.ui instead.
 #   - pygrabber       : Windows-only camera enumeration.
 #
-# torch is intentionally absent. Every torch import in modules/ is guarded, and
-# without it the swapper selects the fp32 inswapper model (see deploy/README.md).
+# torch is required by the LivePortrait pipeline: every one of its ONNX model
+# wrappers binds torch tensors, not just the compositing step, so it cannot be
+# avoided without rewriting all of them.
+#
+# Consequence to watch: modules/processors/frame/face_swapper.py gates its fp16
+# model on torch.cuda, so installing torch silently flips the swapper's default
+# to fp16 - which measured 5x SLOWER on a GPU without tensor cores. The server
+# pins the model explicitly at startup rather than relying on that gate.
 
 numpy>=2.0,<3
 typing-extensions>=4.15.0
@@ -40,3 +46,10 @@ tensorflow-cpu>=2.16
 
 # Streaming server.
 aiohttp>=3.10,<4
+
+# LivePortrait pipeline (see deploy/liveportrait/). cu126 matches the base image.
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch>=2.6
+torchvision>=0.21
+pyyaml>=6.0
+omegaconf>=2.3
