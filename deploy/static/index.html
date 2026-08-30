@@ -212,6 +212,16 @@
       <select id="camera"><option value="">default</option></select>
     </label>
     <button id="refreshCams" title="Re-scan for cameras">⟳ Re-scan</button>
+    <label title="How many frames may be awaiting a reply. 1 is right locally; raise it when the server is far away, where each frame otherwise costs a full round trip">Frames in flight
+      <select id="inFlight">
+        <option value="1">1 — local</option>
+        <option value="2">2</option>
+        <option value="3">3</option>
+        <option value="4">4 — remote</option>
+        <option value="6">6</option>
+        <option value="8">8</option>
+      </select>
+    </label>
     <label>FPS cap
       <select id="fps">
         <option value="10">10</option>
@@ -298,8 +308,11 @@ const statusEl = $("status");
 const token = new URLSearchParams(location.search).get("token") || "";
 
 let ws = null, stream = null, running = false;
-let inFlight = false, sourceReady = false, sessionId = "", obsBase = "";
-let frames = 0, lastTick = performance.now(), lastLatency = 0, sentAt = 0, lastNagAt = 0;
+let inFlight = 0, maxInFlight = 1, sourceReady = false, sessionId = "", obsBase = "";
+// Send times, one per frame in flight, so latency stays measurable when there
+// is more than one. A single sentAt would report the newest frame's age.
+let sentTimes = [], lastReplyAt = 0;
+let frames = 0, lastTick = performance.now(), lastLatency = 0, lastNagAt = 0;
 const canvas = document.createElement("canvas");
 const ctx = canvas.getContext("2d", { willReadFrequently: false });
 
@@ -479,7 +492,7 @@ async function switchCamera() {
     return;
   }
   $("cam").srcObject = stream;
-  inFlight = false;   // a frame from the old device will never be answered
+  inFlight = 0; sentTimes = [];   // frames from the old device are never answered
   buildCameraControls();
   setStatus("Camera switched.", "ok");
 }
@@ -549,8 +562,9 @@ function connect() {
       return;
     }
     // Binary: a swapped frame.
-    lastLatency = performance.now() - sentAt;
-    inFlight = false;
+    lastLatency = performance.now() - (sentTimes.shift() ?? performance.now());
+    inFlight = Math.max(0, inFlight - 1);
+    lastReplyAt = performance.now();
     frames++;
     const blob = new Blob([ev.data], { type: "image/jpeg" });
     const url = URL.createObjectURL(blob);
@@ -638,6 +652,10 @@ function fillModels(models, settings) {
 function applySettings(st) {
   if (!st) return;
   $("model").value = st.model;
+  if (st.in_flight) {
+    maxInFlight = st.in_flight;
+    $("inFlight").value = String(st.in_flight);
+  }
   if (st.mode) {
     $(st.mode === "portrait" ? "modePortrait" : "modeSwap").checked = true;
     $("modeHint").textContent = st.mode === "portrait"
@@ -771,6 +789,11 @@ $("bgFile").addEventListener("change", async (e) => {
 $("lpRecenter").addEventListener("click", () => {
   sendConfig({ recenter: true });
   setStatus("Neutral pose re-taken from your next frame.", "ok");
+});
+
+$("inFlight").addEventListener("change", (e) => {
+  maxInFlight = parseInt(e.target.value, 10);
+  sendConfig({ in_flight: maxInFlight });
 });
 
 $("model").addEventListener("change", (e) => {
@@ -931,7 +954,13 @@ function pump() {
       }
       return;
     }
-    if (inFlight) return;
+    // A dropped frame is never answered - the server keeps only the newest
+    // when it falls behind - so the window has to recover on its own or the
+    // stream would wedge with a full count and nothing coming back.
+    if (inFlight > 0 && lastReplyAt && now - lastReplyAt > 3000) {
+      inFlight = 0; sentTimes = [];
+    }
+    if (inFlight >= maxInFlight) return;
     if (now - last < interval) return;
     if (!video.videoWidth) return;
     last = now;
@@ -942,8 +971,8 @@ function pump() {
     canvas.toBlob((blob) => {
       if (!blob || !running || ws.readyState !== WebSocket.OPEN) return;
       blob.arrayBuffer().then((buf) => {
-        inFlight = true;
-        sentAt = performance.now();
+        inFlight++;
+        sentTimes.push(performance.now());
         ws.send(buf);
       });
     }, "image/jpeg", 0.8);

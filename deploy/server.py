@@ -29,6 +29,7 @@ keeps latency bounded under load.
 
 import asyncio
 import base64
+import collections
 import json
 import logging
 import os
@@ -134,6 +135,10 @@ _current_model = DEFAULT_MODEL
 # "portrait" - LivePortrait: animates the chosen portrait, so the output has
 #              *that image's* hair, head and background, driven by the camera.
 _mode = "swap"
+
+# Frames a client may keep in flight. One locally, where a round trip is
+# nothing; more when the GPU is a continent away. See LatestSlot.
+IN_FLIGHT = max(1, min(8, int(os.environ.get("DLC_IN_FLIGHT", "1"))))
 
 
 def available_models():
@@ -282,6 +287,7 @@ def current_settings():
         "mode": _mode,
         "liveportrait": LP.status(),
         "portrait": LP.params(),
+        "in_flight": IN_FLIGHT,
         "matting": {"available": matting.ENGINE.available()},
         "model": _current_model,
         "brightness": _adjust["brightness"],
@@ -406,21 +412,40 @@ def is_nsfw(frame: np.ndarray) -> bool:
 # --- Session plumbing ---------------------------------------------------------
 
 class LatestSlot:
-    """A one-slot mailbox. Writing overwrites, so consumers always get the newest."""
+    """A short queue of the newest frames, oldest dropped when it overflows.
 
-    def __init__(self) -> None:
-        self._item: Optional[bytes] = None
+    Depth 1 is the original behaviour and the right one locally: a single frame
+    in flight, the sender paced by whatever the GPU sustains, no queueing.
+
+    It stops being right the moment the GPU is far away. One frame in flight
+    means one round trip per frame, so throughput is capped at 1/RTT no matter
+    how fast the card is - measured from Nairobi to a European pod, 333 ms of
+    round trip caps a 20 ms swap at three frames a second. Depth is what buys
+    that back: the client keeps `depth` frames in flight, and throughput becomes
+    depth/RTT while latency stays one round trip.
+
+    Still bounded, and still newest-first on overflow, because the alternative
+    is a queue that grows until the stream is minutes behind the camera.
+    """
+
+    def __init__(self, depth: int = 1) -> None:
+        self._items: Deque[bytes] = collections.deque(maxlen=max(1, depth))
         self._event = asyncio.Event()
 
+    def set_depth(self, depth: int) -> None:
+        """Resize in place, keeping whatever is already queued."""
+        self._items = collections.deque(self._items, maxlen=max(1, depth))
+
     def put(self, item: bytes) -> None:
-        self._item = item
+        self._items.append(item)  # a full deque drops from the left
         self._event.set()
 
     async def get(self) -> bytes:
-        await self._event.wait()
-        self._event.clear()
-        item, self._item = self._item, None
-        return item
+        while True:
+            if self._items:
+                return self._items.popleft()
+            self._event.clear()
+            await self._event.wait()
 
 
 class Broadcast:
@@ -458,7 +483,7 @@ class Session:
         # which is what makes changing face mid-stream instant.
         self.faces: Dict[str, dict] = {}
         self.active_face_id: Optional[str] = None
-        self.slot = LatestSlot()
+        self.slot = LatestSlot(IN_FLIGHT)
         self.broadcast = Broadcast(placeholder_jpeg("waiting for stream"))
         # Counters exist to answer "is the client actually sending frames?".
         # Without them a silent client and a broken swap look identical here.
@@ -744,6 +769,12 @@ async def apply_config(ws: web.WebSocketResponse, body: dict) -> None:
                             ("saturation", 0.0, 3.0)):
             if key in body:
                 _adjust[key] = max(lo, min(hi, float(body[key])))
+        if "in_flight" in body:
+            global IN_FLIGHT
+            IN_FLIGHT = max(1, min(8, int(body["in_flight"])))
+            for sess in _sessions.values():
+                sess.slot.set_depth(IN_FLIGHT)
+            _LOG.info("frames in flight -> %d", IN_FLIGHT)
         if "many_faces" in body:
             modules.globals.many_faces = bool(body["many_faces"])
         # color_correction is deliberately absent: apply_color_transfer is

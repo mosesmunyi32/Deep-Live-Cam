@@ -136,6 +136,8 @@ class FasterLivePortraitPipeline:
 
     def prepare_source(self, source_path, **kwargs):
         print(f"process source:{source_path} >>>>>>>>")
+        # PATCH: see the except below - the traceback is kept, not just printed.
+        self.last_error = None
         try:
             if utils.is_video(source_path):
                 self.is_source_video = True
@@ -275,6 +277,12 @@ class FasterLivePortraitPipeline:
             return len(self.src_infos) > 0
         except Exception as e:
             traceback.print_exc()
+            # PATCH: keep it as well as printing it. The caller only ever sees
+            # False, which it reports as "no usable face in this image" - so a
+            # genuine failure sends you hunting for a better photo. On a host
+            # with no shell, a pod, stdout is unreachable and that guess is all
+            # you get. lp_engine surfaces this through /models instead.
+            self.last_error = traceback.format_exc()
             return False
 
     def retarget_eye(self, kp_source, eye_close_ratio):

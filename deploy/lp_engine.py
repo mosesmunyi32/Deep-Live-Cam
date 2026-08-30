@@ -83,6 +83,12 @@ CUDA_PROVIDER_OPTIONS = {
     "cudnn_conv_algo_search": "HEURISTIC",
     "cudnn_conv_use_max_workspace": "0",
     "arena_extend_strategy": "kSameAsRequested",
+    # TF32 is on by default in ORT, and on Ampere and later it silently routes
+    # fp32 convolutions through tensor cores at ~10 bits of mantissa. That is
+    # the one numerical difference between a card with tensor cores and one
+    # without, so it is the first thing to turn off when a model behaves
+    # differently on a bigger GPU than it does here. DLC_TF32=0 does that.
+    "use_tf32": os.environ.get("DLC_TF32", "1"),
 }
 
 
@@ -253,8 +259,14 @@ class LivePortraitEngine:
         try:
             cv2.imwrite(path, bgr)
             if not pipe.prepare_source(path, realtime=True):
+                # The vendored code catches everything and returns False, so
+                # this is the only place the real cause can be recovered.
+                self._error = getattr(pipe, "last_error", None)
+                if self._error:
+                    _LOG.error("portrait prepare failed:\n%s", self._error)
                 self._raise_if_oom()
                 return None
+            self._error = None
             if not pipe.src_imgs or not pipe.src_infos:
                 return None
             return pipe.src_imgs[0], pipe.src_infos[0]
