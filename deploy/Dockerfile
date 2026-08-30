@@ -126,6 +126,17 @@ from omegaconf import OmegaConf; \
 from src.pipelines.faster_live_portrait_pipeline import FasterLivePortraitPipeline; \
 print('liveportrait import OK, weights present')"
 
+# The paste-back mask is a file the pipeline reads with cv2.imread, which
+# answers a missing path with None rather than an error. It went missing once
+# already - .gitignore's *.png rule kept it out of the build context - and the
+# result was a portrait mode that loaded, ran, and failed on every source.
+RUN python -c "\
+import cv2; \
+p = '/app/deploy/liveportrait/assets/mask_template.png'; \
+m = cv2.imread(p); \
+assert m is not None and m.size, f'mask template missing or unreadable: {p}'; \
+print('mask template OK', m.shape)"
+
 # Then prove every weight is a graph this onnxruntime can actually build a
 # session for. Importing and checking the files exist is not enough: the
 # GridSample3D custom op above passed both of those and still failed on the

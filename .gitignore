@@ -33,3 +33,9 @@ install.bat
 # TLS material for local HTTPS - never commit private keys
 deploy/certs/
 *.pem
+
+# The LivePortrait paste-back mask is an asset, not a screenshot. *.png above
+# swallowed it, so CI built an image without it: cv2.imread returned nothing,
+# the mask came out empty, and the failure surfaced on the pod as "no usable
+# face in this image" - a bad photo, apparently, on a machine with no shell.
+!deploy/liveportrait/assets/*.png

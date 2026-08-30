@@ -180,6 +180,19 @@ class LivePortraitEngine:
                 cfg.infer_params[key] = value
             with _frugal_sessions():
                 self._pipe = FasterLivePortraitPipeline(cfg=cfg, is_animal=False)
+
+            # The pipeline loads its paste-back mask with cv2.imread, which
+            # returns None for a missing file and leaves an empty array behind.
+            # Nothing checks it until warpAffine asserts deep inside
+            # prepare_source, where the exception is swallowed and reported as
+            # "no usable face in this image". Fail here instead, where the
+            # message can say what is actually wrong.
+            mask = getattr(self._pipe, "mask_crop", None)
+            if mask is None or getattr(mask, "size", 0) == 0:
+                self._pipe = None
+                raise RuntimeError(
+                    f"LivePortrait mask template missing or unreadable: "
+                    f"{cfg.infer_params.mask_crop_path}")
             _LOG.info("LivePortrait pipeline ready")
             return self._pipe
 
