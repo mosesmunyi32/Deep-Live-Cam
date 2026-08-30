@@ -65,6 +65,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import modules.globals  # noqa: E402
 import modules.processors.frame.face_swapper as face_swapper  # noqa: E402
 from modules.face_analyser import get_one_face  # noqa: E402
+import matting  # noqa: E402
+import skin_tone  # noqa: E402
 from lp_engine import ENGINE as LP  # noqa: E402
 
 
@@ -149,6 +151,10 @@ def available_models():
     for fname in names:
         if not fname.endswith(".onnx"):
             continue
+        # Not a swapper. It sits in models/ because that is where weights live,
+        # but offering it in the model selector would only invite an error.
+        if os.path.basename(matting.MODEL_PATH) == fname:
+            continue
         path = os.path.join(MODELS_DIR, fname)
         out.append({
             "id": fname,
@@ -201,12 +207,41 @@ def set_model(fname: str) -> str:
         )
         face_swapper.FACE_DETECTION_CACHE.clear()
         face_swapper.FRAME_CACHE.clear()
+        # Additive, not a patch to modules/: the correction sits between the
+        # swapper and upstream's caller, where the swapped face and the face it
+        # replaces are still in the same aligned space.
+        skin_tone.wrap(model, lambda: float(getattr(modules.globals, "skin_tone", 0.0)))
         face_swapper.FACE_SWAPPER = model
         del previous
 
         _current_model = fname
         _LOG.info("swapper model -> %s (input %s)", fname, model.input_size)
         return _current_model
+
+
+def unload_swapper() -> None:
+    """Release the swapper's GPU memory. Blocking; call on the inference thread.
+
+    Portrait mode never touches the swapper, and on a small card the two model
+    sets do not fit at once: with inswapper resident, LivePortrait runs a 4 GB
+    card out of memory partway through preparing a face.
+    """
+    import gc
+
+    with _model_lock:
+        if face_swapper.FACE_SWAPPER is None:
+            return
+        # Same invalidation as a model change: the graph is recorded against
+        # buffers that are about to be freed.
+        face_swapper._cuda_graph_session.update(
+            session=None, io_binding=None, ort_input=None,
+            ort_latent=None, recorded=False,
+        )
+        face_swapper.FACE_DETECTION_CACHE.clear()
+        face_swapper.FRAME_CACHE.clear()
+        face_swapper.FACE_SWAPPER = None
+        gc.collect()
+    _LOG.info("swapper unloaded to free VRAM for portrait mode")
 
 
 def obs_base() -> Optional[str]:
@@ -246,6 +281,8 @@ def current_settings():
     return {
         "mode": _mode,
         "liveportrait": LP.status(),
+        "portrait": LP.params(),
+        "matting": {"available": matting.ENGINE.available()},
         "model": _current_model,
         "brightness": _adjust["brightness"],
         "contrast": _adjust["contrast"],
@@ -255,6 +292,7 @@ def current_settings():
         "mouth_mask_size": float(getattr(modules.globals, "mouth_mask_size", 0.0)),
         "opacity": float(getattr(modules.globals, "opacity", 1.0)),
         "sharpness": float(getattr(modules.globals, "sharpness", 0.0)),
+        "skin_tone": float(getattr(modules.globals, "skin_tone", 0.0)),
         "poisson_blend": bool(getattr(modules.globals, "poisson_blend", False)),
         "enable_interpolation": bool(getattr(modules.globals, "enable_interpolation", False)),
         "interpolation_weight": float(getattr(modules.globals, "interpolation_weight", 0.2)),
@@ -334,6 +372,19 @@ def process_jpeg(entry: dict, payload: bytes, first: bool = False) -> Optional[b
         out = LP.animate(frame, source, first_frame=first)
         return encode(out) if out is not None else None
 
+    # Cheap attribute check. The model reaches this point from three different
+    # loaders - selection, warm-up, and upstream's lazy path - and only the
+    # first goes through set_model.
+    if face_swapper.FACE_SWAPPER is not None:
+        skin_tone.wrap(face_swapper.FACE_SWAPPER,
+                       lambda: float(getattr(modules.globals, "skin_tone", 0.0)))
+
+    if face_swapper.FACE_SWAPPER is None:
+        # Portrait mode unloads it. Upstream's lazy loader would happily reload
+        # on the next call, but it picks fp16 whenever torch.cuda is importable -
+        # which it now is, because LivePortrait needs torch - and fp16 measured
+        # six times slower on this card. Reload what was actually selected.
+        set_model(_current_model)
     return encode(face_swapper.process_frame(entry["face"], frame))
 
 
@@ -417,6 +468,11 @@ class Session:
         self.last_frame_at = 0.0
 
         self.first_frame = True
+
+        # Restaging belongs to the picture you staged, so it is per session
+        # rather than process-wide like the mode and the model.
+        self.background = {"mode": "keep", "colour": "#000000", "head_crop": False}
+        self.background_image = None
 
     def active_entry(self):
         return self.faces.get(self.active_face_id or "")
@@ -546,6 +602,7 @@ async def handle_mjpeg(request: web.Request) -> web.StreamResponse:
 
 async def process_loop(ws: web.WebSocketResponse, session: Session) -> None:
     loop = asyncio.get_running_loop()
+    last_notice = 0.0
     while True:
         payload = await session.slot.get()
         if session.source_face is None:
@@ -560,7 +617,17 @@ async def process_loop(ws: web.WebSocketResponse, session: Session) -> None:
             if entry is None:
                 continue
             first, session.first_frame = session.first_frame, False
+            missed_before = LP.missed
             out = await loop.run_in_executor(EXECUTOR, process_jpeg, entry, payload, first)
+            # Say so, at most every few seconds: a portrait holding still
+            # because it cannot see you looks identical, from the other end, to
+            # one that has broken.
+            if LP.missed > missed_before and time.time() - last_notice > 5:
+                last_notice = time.time()
+                await ws.send_json({
+                    "type": "status",
+                    "message": "No face found in the camera - the portrait is "
+                               "holding still."})
         except Exception as exc:
             _LOG.exception("swap failed")
             await ws.send_json({"type": "error", "message": f"swap failed: {exc}"})
@@ -605,6 +672,9 @@ async def handle_ws(request: web.Request) -> web.StreamResponse:
             "session": sid,
             "models": available_models(),
             "settings": current_settings(),
+            # Per-session, unlike everything in settings, so it rides along
+            # separately rather than pretending to be global state.
+            "background": session.background,
             "obs_base": obs_base(),
         })
         async for msg in ws:
@@ -633,6 +703,12 @@ async def handle_ws(request: web.Request) -> web.StreamResponse:
                     await use_face(ws, session, body.get("id", ""))
                 elif kind == "drop_face":
                     await drop_face(ws, session, body.get("id", ""))
+                elif kind == "background":
+                    try:
+                        await set_background(ws, session, body)
+                    except Exception as exc:
+                        await ws.send_json({"type": "error",
+                                            "message": f"background rejected: {exc}"})
                 elif kind == "config":
                     await apply_config(ws, body)
             elif msg.type == WSMsgType.ERROR:
@@ -655,6 +731,10 @@ async def apply_config(ws: web.WebSocketResponse, body: dict) -> None:
     try:
         if "mode" in body:
             await set_mode(ws, body["mode"])
+        if "portrait" in body:
+            await set_portrait_params(ws, body["portrait"])
+        if body.get("recenter"):
+            recenter()
         if "model" in body:
             # Model reload is blocking and touches the GPU: keep it on the
             # inference thread so it cannot overlap a swap in flight.
@@ -674,6 +754,7 @@ async def apply_config(ws: web.WebSocketResponse, body: dict) -> None:
                 setattr(modules.globals, key, bool(body[key]))
         for key, lo, hi in (("opacity", 0.0, 1.0),
                             ("sharpness", 0.0, 1.0),
+                            ("skin_tone", 0.0, 1.0),
                             ("interpolation_weight", 0.0, 1.0),
                             ("mouth_mask_size", 0.0, 100.0)):
             if key in body:
@@ -706,6 +787,25 @@ async def set_mode(ws: web.WebSocketResponse, mode: str) -> None:
     _mode = mode
     LP.reset()
     _LOG.info("mode -> %s", mode)
+
+    # Only one of the two model sets is ever in use, and they do not both fit on
+    # a small card, so the idle one is released on every switch. The cost is a
+    # reload on the way back - seconds, once, against portrait mode not running
+    # at all on 4 GB.
+    loop = asyncio.get_running_loop()
+    if mode == "portrait":
+        await loop.run_in_executor(EXECUTOR, unload_swapper)
+    else:
+        # Prepared sources hold device tensors of their own, so they are dropped
+        # *before* the unload rather than after: a live reference at that moment
+        # pins the very memory the unload exists to release, and the swapper's
+        # reload then fails for want of 36 MB.
+        for sess in _sessions.values():
+            for entry in sess.faces.values():
+                entry["lp"] = None
+        LP.unload()
+        await loop.run_in_executor(EXECUTOR, set_model, _current_model)
+
     # Prepare the active face for every live session, so switching mode does not
     # produce a stall on the next frame instead of a picture.
     for sess in list(_sessions.values()):
@@ -713,6 +813,45 @@ async def set_mode(ws: web.WebSocketResponse, mode: str) -> None:
             if mode == "portrait":
                 await ensure_portrait_source(ws, sess, sess.active_face_id)
             sess.first_frame = True
+
+
+async def set_portrait_params(ws: web.WebSocketResponse, updates) -> None:
+    """Apply LivePortrait parameters, re-preparing faces when one invalidates them.
+
+    Process-wide like the model and the mode, for the same reason: the pipeline
+    and its config are module-level state shared by every session.
+    """
+    if not isinstance(updates, dict):
+        raise ValueError("portrait settings must be an object")
+    loop = asyncio.get_running_loop()
+    # The writes are trivial, but they land on the config the inference thread
+    # reads mid-frame, so they go through the executor like a model change does.
+    applied, stale = await loop.run_in_executor(EXECUTOR, LP.set_params, updates)
+    if not applied:
+        return
+
+    for sess in list(_sessions.values()):
+        if stale:
+            # prepare_source baked the old values in, so every prepared face is
+            # now wrong. Dropping them is not enough on its own - the active one
+            # is re-prepared here, or the next frame would stall on it instead.
+            for entry in sess.faces.values():
+                entry["lp"] = None
+            if _mode == "portrait" and sess.active_face_id:
+                await ensure_portrait_source(ws, sess, sess.active_face_id)
+    recenter()
+
+
+def recenter() -> None:
+    """Re-take the neutral reference pose from each session's next frame.
+
+    LivePortrait measures motion against the pose it saw first. Whatever you
+    were doing at that instant became "neutral", so a head that was turned or a
+    mouth that was open is baked in as the rest position until it is re-taken.
+    """
+    LP.reset()
+    for sess in list(_sessions.values()):
+        sess.first_frame = True
 
 
 def missing_or_none():
@@ -780,6 +919,79 @@ async def use_face(ws: web.WebSocketResponse, session: Session, fid: str) -> Non
                         "message": f"switched to {session.faces[fid]['label']}"})
 
 
+def hex_to_bgr(value: str):
+    value = value.lstrip("#")
+    if len(value) != 6:
+        raise ValueError(f"colour must be #rrggbb, not {value!r}")
+    r, g, b = (int(value[i:i + 2], 16) for i in (0, 2, 4))
+    return (b, g, r)
+
+
+def portrait_image(session: "Session", entry: dict) -> np.ndarray:
+    """The picture LivePortrait animates, after any restaging.
+
+    Only portrait mode uses this. In swap mode the background of the source is
+    irrelevant - only the face embedding is taken from it - so restaging there
+    would cost a matte for nothing.
+    """
+    bg = session.background
+    if bg["mode"] == "keep" and not bg["head_crop"]:
+        return entry["image"]
+    image, alpha = matting.restage(
+        entry["image"], bg["mode"],
+        colour_bgr=hex_to_bgr(bg["colour"]),
+        background=session.background_image,
+        bbox=entry["face"].bbox if bg["head_crop"] else None,
+        alpha=entry.get("alpha"))
+    entry["alpha"] = alpha  # the mask survives a change of backdrop
+    return image
+
+
+async def set_background(ws: web.WebSocketResponse, session: "Session",
+                         body: dict) -> None:
+    """Restage every staged picture in this session."""
+    bg = dict(session.background)
+    if "mode" in body:
+        if body["mode"] not in ("keep", "colour", "image"):
+            raise ValueError(f"unknown background mode {body['mode']!r}")
+        bg["mode"] = body["mode"]
+    if "colour" in body:
+        hex_to_bgr(body["colour"])  # validate before storing
+        bg["colour"] = body["colour"]
+    if "head_crop" in body:
+        bg["head_crop"] = bool(body["head_crop"])
+    if body.get("image"):
+        raw = base64.b64decode(body["image"].split(",")[-1])
+        image = decode_jpeg(raw)
+        if image is None:
+            await ws.send_json({"type": "error",
+                                "message": "background image is not decodable"})
+            return
+        session.background_image = image
+    if bg["mode"] == "image" and session.background_image is None:
+        await ws.send_json({"type": "error",
+                            "message": "choose a background image first"})
+        return
+    if bg["mode"] != "keep" and not matting.ENGINE.available():
+        await ws.send_json({"type": "error",
+                            "message": "matting model missing - background removal unavailable"})
+        return
+
+    session.background = bg
+    # Restaging changes the picture itself, so everything prepared from the old
+    # one is stale. The alpha is kept: it is the expensive half and does not
+    # depend on what goes behind it.
+    for entry in session.faces.values():
+        entry["lp"] = None
+    _LOG.info("session %s: background -> %s", session.id, bg)
+
+    if _mode == "portrait" and session.active_face_id:
+        await ensure_portrait_source(ws, session, session.active_face_id)
+    session.first_frame = True
+    await ws.send_json({"type": "settings", "settings": current_settings(),
+                        "background": bg})
+
+
 async def ensure_portrait_source(ws: web.WebSocketResponse, session: Session, fid: str) -> bool:
     """Prepare a face for portrait mode. Expensive, so done once and cached."""
     entry = session.faces.get(fid)
@@ -788,7 +1000,8 @@ async def ensure_portrait_source(ws: web.WebSocketResponse, session: Session, fi
     loop = asyncio.get_running_loop()
     await ws.send_json({"type": "status", "message": "preparing portrait…"})
     try:
-        src = await loop.run_in_executor(EXECUTOR, LP.prepare_source, entry["image"])
+        image = await loop.run_in_executor(EXECUTOR, portrait_image, session, entry)
+        src = await loop.run_in_executor(EXECUTOR, LP.prepare_source, image)
     except Exception as exc:
         _LOG.exception("portrait prepare failed")
         await ws.send_json({"type": "error", "message": f"portrait prepare failed: {exc}"})

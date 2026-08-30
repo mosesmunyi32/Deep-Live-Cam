@@ -112,14 +112,24 @@ class FasterLivePortraitPipeline:
 
     def calc_combined_eye_ratio(self, c_d_eyes_i, source_lmk):
         c_s_eyes = calc_eye_close_ratio(source_lmk[None])
-        c_d_eyes_i = np.array(c_d_eyes_i).reshape(1, 1)
+        # PATCH: the realtime path passes both eyes' ratios (1x2) where the video
+        # path passes the single driving scalar this was written for, so
+        # reshape(1, 1) raised "cannot reshape array of size 2" the moment eye
+        # retargeting was switched on. Average the two - the retargeting network
+        # takes one driving value, and a scalar is what the caller meant.
+        c_d_eyes_i = np.asarray(c_d_eyes_i, dtype=np.float32).reshape(1, -1).mean(
+            axis=1, keepdims=True)
         # [c_s,eyes, c_d,eyes,i]
         combined_eye_ratio_tensor = np.concatenate([c_s_eyes, c_d_eyes_i], axis=1)
         return combined_eye_ratio_tensor
 
     def calc_combined_lip_ratio(self, c_d_lip_i, source_lmk):
         c_s_lip = calc_lip_close_ratio(source_lmk[None])
-        c_d_lip_i = np.array(c_d_lip_i).reshape(1, 1)  # 1x1
+        # PATCH: same coercion as the eye path above. calc_lip_close_ratio already
+        # returns 1x1 so this changes nothing today, but it stops the two paths
+        # from failing differently if that ever changes.
+        c_d_lip_i = np.asarray(c_d_lip_i, dtype=np.float32).reshape(1, -1).mean(
+            axis=1, keepdims=True)  # 1x1
         # [c_s,lip, c_d,lip,i]
         combined_lip_ratio_tensor = np.concatenate([c_s_lip, c_d_lip_i], axis=1)  # 1x2
         return combined_lip_ratio_tensor

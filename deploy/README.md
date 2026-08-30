@@ -208,10 +208,56 @@ Blend controls that genuinely affect the result:
 | `sharpness` | Sharpens the swapped region | small |
 | `poisson_blend` | Seamless-clone the edges — best join | **~10-30 ms/frame** |
 | `enable_interpolation` | Blends with the previous frame, reducing flicker | small |
+| `skin_tone` | Pulls the swapped face's colour back towards your own | ~1 ms |
 
-**`color_correction` is not exposed, deliberately.** `apply_color_transfer` is
-defined in `face_swapper.py` but never called from the swap path, so a toggle
-for it would silently do nothing.
+### Keeping your own complexion
+
+`inswapper` brings the source's identity **and** their skin tone, which is what
+makes a swap read as pasted-on when the two were lit differently. **Keep my skin
+tone** (`skin_tone`, 0-1) pulls the colour back towards the face being replaced
+while leaving the geometry - the identity - alone. Measured against the real
+face's mean LAB, with a source of a different complexion:
+
+| strength | distance from the real face |
+|---|---|
+| 0.0 | 2.0 |
+| 0.5 | 1.0 |
+| 1.0 | 0.6 |
+
+Three decisions worth knowing, because the obvious version of this looks wrong:
+
+- **It happens in aligned space, on the 128x128 `bgr_fake`, before paste-back.**
+  That is the only point where the swapped pixels and the ones they replace are
+  in exact correspondence, so the two sets of statistics describe the same
+  features rather than two different framings.
+- **Statistics are sampled through an eroded ellipse**, not the whole crop. The
+  aligned square contains background at its corners and a feathered rim that is
+  half background; averaging those in measures the room, not a skin tone.
+- **The per-channel scale is clamped to 0.6-1.6.** Matching the standard
+  deviation as well as the mean is what makes tone match under different
+  lighting, but an unclamped scale posterises skin when the target face is in
+  harsh light.
+
+**`apply_color_transfer` is still unused, and still should be.** It is defined in
+`face_swapper.py` and matches over an entire image, which is precisely the
+whole-crop average described above. Exposing *it* would be the control that
+silently does the wrong thing; `deploy/skin_tone.py` is the one wired in.
+
+Nothing under `modules/` is modified for this. The correction is inserted by
+wrapping the swapper model's own `get()`, which is where upstream hands back the
+swapped face and its affine.
+
+### Keeping the original face instead
+
+Two controls already do this, and they answer different questions:
+
+| Control | Effect |
+|---|---|
+| `opacity` | Blends the swap with your real face. At 0.5 you get half of each; at 0 the swap is off |
+| `mouth_mask` | Keeps your real mouth and its movement, swapping everything else |
+
+Together with `skin_tone` these cover "make it look like me": your complexion,
+your mouth, and as much or as little of the swapped identity as you want.
 
 ### The real gap: occlusion
 
@@ -221,6 +267,233 @@ is geometric, not content-aware, so the swapped face is painted over the
 occluder. Fixing that needs a face-parsing/segmentation model (BiSeNet-class)
 baked in and applied per frame, which is real work and real latency. The eye and
 eyebrow masks in `face_masking.py` are not wired into this pipeline either.
+
+## Portrait mode
+
+Portrait mode is the answer to "swap the hair too". It does not replace a region
+in your frame at all — it animates the *chosen picture* with your expression and
+head motion, so the output is that person's whole head: hair, ears, jaw, skin,
+and their background too. Your camera supplies the performance, not the pixels.
+That framing is the trade: you cannot have their hair **and** your background.
+
+### The controls, and which ones are free
+
+Every parameter is read inside the pipeline's per-frame `_run`, so a change
+lands on the next frame without rebuilding the ~1.5 GB of ONNX sessions:
+
+| Control | What it does |
+|---|---|
+| `animation_region` | `all`, or restrict to `exp` / `pose` / `lip` / `eyes` — hold the head still and animate only the face, or only the mouth |
+| `driving_multiplier` | Scales motion away from the source pose. Above 1 exaggerates, below 1 damps |
+| `flag_relative_motion` | Off drives the absolute pose instead of the change since the reference frame |
+| `flag_eye_retargeting` / `flag_lip_retargeting` | Match the picture's eye and mouth opening to yours |
+
+Three others — `flag_pasteback`, `flag_stitching`, `flag_normalize_lip` — are
+**not** free. `prepare_source` bakes their consequences into each face's
+`src_info`: the paste-back mask is built there and lip normalisation is applied
+there. Changing one makes every prepared face stale, so the server drops and
+re-prepares them, about a second each. The control page says so rather than
+appearing to stall.
+
+The controls stay usable in swap mode instead of being hidden with the mode they
+belong to: staging the look and then switching is the normal order, and a
+control that only exists after the switch cannot be set up beforehand.
+
+**Re-zero pose** exists because LivePortrait measures motion against the pose it
+saw first. Whatever you were doing at that instant became "neutral" — a head
+turned away, or a mouth left open, stays baked in as the rest position. The
+button re-takes it from your next frame.
+
+### Restaging the picture: background removal
+
+Portrait mode animates the source picture and pastes the head back into it, so
+everything around that head goes out on the stream — a screenshot's window
+chrome, a watermark, the room it was taken in. **Background** replaces it:
+
+| Backdrop | What you get |
+|---|---|
+| *keep the picture as it is* | default, no matting, no cost |
+| *solid colour* | the people, on a colour of your choice — green for a chroma key downstream |
+| *my own image* | the people, over an uploaded picture, scaled to fill rather than letterboxed |
+| **Head only** | crops to the head — hair included — before any of the above |
+
+This is cheap because it is a **still-image** problem. The source is staged once
+when you add a face, so `u2net_human_seg` (the person-segmentation half of
+U^2-Net) runs about **1.2 s per picture on CPU** and never appears on the frame
+path. It is CPU by default, and not merely as a fallback: it would otherwise sit
+beside the LivePortrait pipeline on a 4 GB card that has no room for it.
+`DLC_MATTING_DEVICE=cuda` moves it on a card with headroom.
+
+The mask is cached per face and survives a change of backdrop, because the
+expensive half does not depend on what goes behind it. Changing colour or
+picture is instant; the first cut-out is not.
+
+Three things the naive version got wrong, all visible in the output before they
+were fixed:
+
+- **A halo of the old background.** Edge pixels are part subject, part
+  backdrop; composited onto green they fringe green. `refine()` raises the
+  mask's contrast and erodes it a pixel.
+- **"No usable face" on a head crop.** A head cropped out of a screenshot can
+  be 130 px across, and LivePortrait's detector finds nothing in that — while
+  the message blames the photo. Crops are enlarged to 512 px first.
+- **A strip of UI that survived the matte.** Segmentation keeps anything
+  person-shaped, and the strip touched a shoulder, so it was one connected blob
+  with the person — component isolation could not separate them. Head-only
+  staging bounds the mask geometrically, with a soft ellipse centred slightly
+  *above* the face box, since what has to be kept above the brow is hair.
+
+Background is **per session**, unlike the mode and the model: it belongs to the
+picture you staged, the way the face library does. And it applies to portrait
+mode only — face swap takes nothing from the source but the face embedding, so
+restaging there would buy a matte for nothing.
+
+Note that `models/u2net_human_seg.onnx` is excluded from `GET /models`. It lives
+there because that is where weights go, but it is not a swapper, and offering it
+in the selector would only invite an error.
+
+### GridSample3D: why stock onnxruntime cannot load the weights
+
+`warping_spade` is exported with **GridSample3D**, a custom operator that only
+the patched onnxruntime FasterLivePortrait ships knows about. Stock ORT refuses
+the graph outright:
+
+```
+INVALID_GRAPH : No Op registered for GridSample3D with domain_version of 16
+```
+
+The fix does not need a patched runtime. ONNX **opset 20** added 5D support to
+the standard `GridSample`, so the Dockerfile retargets the two nodes onto it
+(`mode: bilinear` becomes opset 20's `linear`) and converts the graph. Same
+semantics, and it runs on the unmodified `onnxruntime-gpu` already installed.
+
+This is also why the build now opens an ORT session against *every* LivePortrait
+weight. Importing the pipeline and checking the files exist both passed while
+this was broken — the failure only appeared on the first animated frame, which
+is an expensive place to discover it.
+
+### VRAM: the two model sets do not coexist
+
+Measured on the 4 GB T1000, with the swapper resident, LivePortrait loads and
+then dies partway through preparing a face — 50 MB free, trying to allocate 20.
+So **switching mode unloads the other side**: entering portrait mode releases
+the swapper, leaving it reloads the swapper and drops the pipeline along with
+every prepared source, since those hold device tensors of their own. The cost is
+a reload of a few seconds on the way back.
+
+ORT's CUDA defaults were the other half. An EXHAUSTIVE convolution search with
+max cuDNN workspace and a doubling arena cost about 1.1 GB of pure headroom;
+`deploy/lp_engine.py` injects `HEURISTIC`, `cudnn_conv_use_max_workspace=0` and
+`kSameAsRequested` around pipeline construction, which brings the load down to
+1.7 GB and the peak to ~2.8 GB. That fits, with the desktop's ~760 MB alongside.
+
+Unloading also has to reach past the vendored code. `clean_models()` empties the
+pipeline's own dict, but the predictor is a **singleton keyed by model path** — a
+class-level cache built to stop the same weights loading twice, which outlives
+the pipeline that created it. With it in place the unload freed 10 MB of 3 GB
+and the switch back to swap died on a 36 MB allocation; clearing
+`OnnxRuntimePredictorSingleton._instance` releases the sessions for real, and the
+next load rebuilds it. Measured: **2187 MB free after the unload, against 154 MB
+before the fix.**
+
+`torch.cuda.empty_cache()` is needed for the same reason on the torch side —
+freed blocks go back to torch's cache, not to the driver, so the swapper's
+reload would otherwise still find nothing.
+
+An allocation failure that happens inside the vendored `prepare_source` is
+caught there and returned as `False`, which reaches the page as "no usable face
+in this image" — sending you to find a better photo when the problem is memory.
+`_raise_if_oom` checks free VRAM before reporting that, and says so instead.
+
+### Two traps in the mode switch
+
+**The mode is process-wide, and a test leaves it that way.** Switching to
+portrait to try something and walking away leaves every client — including a
+phone that connects an hour later — animating a picture instead of swapping.
+"Face swap stopped working" is what that looks like from the page. `GET /models`
+reports the current mode; the control page shows it on connect.
+
+**The swapper must be reloaded explicitly, never lazily.** Upstream's
+`get_face_swapper()` reloads on demand when `FACE_SWAPPER` is None, but it picks
+the **fp16** model whenever `torch.cuda` is importable — and torch is now
+installed, because LivePortrait needs it. fp16 measured six times slower on this
+card. Portrait mode sets `FACE_SWAPPER` to None, so the swap path would have
+walked straight into that on the next frame; it reloads the selected model
+instead.
+
+### A driving frame with no face
+
+`run()` reports "nothing face-shaped in this frame" by returning a **tuple of
+Nones**, not by returning None — so it is only visible after unpacking. It
+happens constantly: a phone camera still warming up, a head turned away, a room
+too dark for the detector. Portrait mode answers with the staged picture,
+holding still, and says so over the socket at most once every five seconds,
+because a portrait that cannot see you looks exactly like a broken one from the
+other end.
+
+Note *when* that can happen. The pipeline detects a face only on the first frame
+after a reset; from then on it tracks the landmarks it already has, which is
+what keeps it affordable. So a face that leaves the frame mid-stream does not
+report a miss — the head simply keeps moving on stale landmarks until you press
+**Re-zero pose**, which is also the fix if it ever locks onto nothing.
+
+Getting this wrong cost a session per miss. A colour-space fix put `cvtColor`
+in front of the None check, and `cv2.cvtColor(None, …)` raises the *same*
+`!_src.empty()` assertion an empty array does — so the first frame the detector
+missed killed the stream, with an error that pointed at colour conversion rather
+than at face detection.
+
+### Eye retargeting crashed on every frame
+
+`calc_combined_eye_ratio` reshapes the driving ratio to `(1, 1)`, which is what
+the video path passes. The realtime path passes **both eyes** — a `(1, 2)` array
+— so switching eye retargeting on raised `cannot reshape array of size 2 into
+shape (1,1)` and killed the session. The vendored pipeline now averages the two,
+since the retargeting network takes a single driving value. The lip path already
+passed a `(1, 1)`, but it got the same coercion so the two cannot diverge later.
+
+### Speed, and why no amount of tuning fixes it here
+
+**~680 ms per frame on the T1000**, against 184 ms for a swap. Profiled per
+model, it is not spread around:
+
+| stage | p50 |
+|---|---|
+| **warping_spade** | **632 ms** |
+| motion_extractor | 24.9 ms |
+| face_analysis (first frame only) | 22.2 ms |
+| landmark | 12.3 ms |
+| stitching | 0.2 ms |
+
+One model is 94% of the frame, and it is compute-bound. Counting the graph's
+convolutions gives **617 G MACs — 1.23 TFLOP per frame**. A T1000 Max-Q peaks at
+about 2.6 TFLOPS fp32, so the floor at *100% of theoretical peak* is **474 ms**.
+Measured 632 ms is roughly 75% of peak, which is close to what a real kernel
+achieves. There is no factor of ten hiding anywhere.
+
+Confirmed from the other end too: under load the card sits at 1440-1515 MHz
+against a 1530 MHz maximum, 100% utilisation, 39 W, 62 °C. Nothing is throttled
+and nothing is idle — it is simply a small GPU running a large generator.
+
+What that means in practice: **portrait mode is a big-GPU feature.** Same
+1.23 TFLOP against an A40's ~37 TFLOPS is ~33 ms at peak, so expect **20-25 fps**
+there; a 4090 more. Measure rather than trust the ratio.
+
+Things tried, measured, and rejected — recorded so nobody spends the afternoon
+again:
+
+| Idea | Result |
+|---|---|
+| Softmax over axis 1 rewritten as transpose → softmax → transpose | Bit-identical output, **slower** (711 vs 670 ms) |
+| Same softmax decomposed into ReduceMax/Sub/Exp/ReduceSum/Div | 708 ms, and 3.5e-06 of drift for the privilege |
+| Four ORT memory/algo configurations, EXHAUSTIVE included | 676-686 ms. All within noise of each other |
+| Checking for CPU fallback | None. All 828 nodes on CUDA |
+| Detecting the driving face every frame instead of tracking | Tracked and detected landmarks differ by **0.2 px**; costs 20 ms for nothing |
+| TensorRT EP | Not installed — `libnvinfer` absent, ~2 GB to add. Worth it on a card where the result would be real-time; not on this one |
+
+fp16 is the one lever left untested, and deliberately so: TU117 has no tensor
+cores, and fp16 measured **6x slower** for the swapper here. On an Ampere card it
+is the obvious next thing to try.
 
 ## Changing face during a stream
 
@@ -319,6 +592,36 @@ way. The face enhancers upstream offers (`face_enhancer`, GPEN 256/512) are not
 selectable because their weights are not baked into the image, and at their cost
 per frame they are not realistic for a live stream anyway.
 
+## Testing without deploying
+
+`deploy/` is bind-mounted into the container, so editing the server, the engine
+or the page needs a restart, not a rebuild:
+
+```bash
+docker restart dlc-local          # ~30 s, same URLs
+```
+
+An image rebuild is only needed when a dependency or a baked weight changes.
+Pushing rebuilds the ghcr image, which matters for a pod and for nothing else.
+
+Two end-to-end checks run against a live server over its real protocol:
+
+```bash
+python deploy/smoketest.py --url http://127.0.0.1:8081 --token <token>
+python deploy/portrait_smoketest.py --token <token>
+```
+
+The first covers the swap path and reports round-trip latency. The second covers
+everything portrait mode added — both mode switches, the retargeting toggles,
+restaging onto a colour, an image and a head crop, a rejected bad colour, and a
+driving frame with no face in it. Every one of those is there because it broke
+in a way the build's import check could not see.
+
+**A test leaves the mode where it put it.** The mode is process-wide, so a
+portrait test that ends in portrait mode leaves the next person to connect
+animating a picture and wondering why nothing swaps. Both scripts end in swap
+mode deliberately.
+
 ## Configuration
 
 | Env var | Default | Meaning |
@@ -328,6 +631,7 @@ per frame they are not realistic for a live stream anyway.
 | `DLC_MAX_SESSIONS` | `2` | Concurrent streams before returning 429. |
 | `DLC_JPEG_QUALITY` | `80` | Return-path JPEG quality. |
 | `DLC_NSFW_FILTER` | `1` | Screen uploaded source faces. |
+| `DLC_MATTING_DEVICE` | `cpu` | Where background removal runs. `cuda` needs VRAM the pipeline may want. |
 | `DLC_MANY_FACES` | `0` | Swap every detected face, not just one. |
 | `DLC_MOUTH_MASK` | `0` | Preserve the target's mouth region. |
 

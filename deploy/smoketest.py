@@ -81,7 +81,10 @@ async def main():
                                 "data": base64.b64encode(source).decode()})
             msg = await ws.receive_json()
             print(f"source upload -> {msg}")
-            if msg.get("type") != "status":
+            # "faces" is the reply since the library landed - the whole library
+            # comes back, not a bare status. Accepting only "status" made a
+            # working upload read as a rejection.
+            if msg.get("type") not in ("faces", "status"):
                 print("FAIL: source face was rejected")
                 return 1
 

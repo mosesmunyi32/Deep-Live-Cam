@@ -73,6 +73,30 @@ RUN mkdir -p /app/models/liveportrait \
            || exit 1; \
        done
 
+# warping_spade is exported with GridSample3D, a custom operator that only the
+# patched onnxruntime FasterLivePortrait ships knows about - stock ORT refuses
+# the graph outright ("No Op registered for GridSample3D"). ONNX opset 20 added
+# 5D support to the standard GridSample, so the node is retargeted onto it and
+# the graph converted. Two nodes, same semantics, and it then runs on the
+# unmodified onnxruntime-gpu already installed here.
+RUN python -c "\
+import onnx; \
+from onnx import version_converter; \
+p = '/app/models/liveportrait/warping_spade-fix.onnx'; \
+m = onnx.load(p); \
+n = [x for x in m.graph.node if x.op_type == 'GridSample3D']; \
+assert n, 'expected GridSample3D nodes - has the export changed?'; \
+[setattr(x, 'op_type', 'GridSample') for x in n]; \
+[setattr(a, 's', b'linear') for x in n for a in x.attribute if a.name == 'mode' and a.s == b'bilinear']; \
+onnx.save(version_converter.convert_version(m, 20), p); \
+print('rewrote', len(n), 'GridSample3D nodes to standard GridSample at opset 20')"
+
+# u2net_human_seg: the person-segmentation half of U^2-Net, used to lift a
+# staged portrait off its background so portrait mode does not inherit a
+# screenshot's window chrome. Run once per staged picture, never per frame.
+RUN curl -fsSL --retry 3 -o /app/models/u2net_human_seg.onnx \
+      "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2net_human_seg.onnx"
+
 # buffalo_l (detection + recognition + landmarks). Downloaded on CPU providers
 # because the build host has no GPU; it lands in ~/.insightface, which is where
 # modules/face_analyser.py looks for it at runtime.
@@ -90,8 +114,8 @@ ps = ort.get_available_providers(); \
 print('providers:', ps); \
 assert 'CUDAExecutionProvider' in ps, 'onnxruntime-gpu has no CUDA provider'"
 
-# Fail the build, not the pod, if the vendored pipeline cannot even import or a
-# weight is missing. No GPU here, so this checks wiring only, not inference.
+# Fail the build, not the pod, if the vendored pipeline cannot import or a
+# weight is missing. There is no GPU here, so inference itself is not exercised.
 RUN python -c "\
 import sys; sys.path.insert(0, '/app/deploy'); \
 from lp_engine import ENGINE, missing_weights; \
@@ -102,6 +126,21 @@ from omegaconf import OmegaConf; \
 from src.pipelines.faster_live_portrait_pipeline import FasterLivePortraitPipeline; \
 print('liveportrait import OK, weights present')"
 
+# Then prove every weight is a graph this onnxruntime can actually build a
+# session for. Importing and checking the files exist is not enough: the
+# GridSample3D custom op above passed both of those and still failed on the
+# first frame at runtime, which is an expensive place to find out.
+RUN python -c "\
+import glob, onnxruntime as ort; \
+files = sorted(glob.glob('/app/models/liveportrait/*.onnx')); \
+assert files, 'no LivePortrait weights to check'; \
+[ort.InferenceSession(f, providers=['CPUExecutionProvider']) and \
+ print('session OK:', f.rsplit('/', 1)[-1]) for f in files]"
+
+# torch appears only in the LivePortrait path, where its allocator fragments
+# enough to matter on a small card. Set here rather than in the ENV block at the
+# top, which every layer below would have to be rebuilt for.
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ENV PORT=8080
 EXPOSE 8080
 

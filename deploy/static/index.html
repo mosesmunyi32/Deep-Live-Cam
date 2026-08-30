@@ -164,6 +164,47 @@
   </div>
 </details>
 
+<details id="portraitRow">
+  <summary>Portrait options <em>— tune the animation</em></summary>
+  <div class="body">
+    <span id="portraitHint" class="hint"></span>
+    <label>Animate
+      <select id="lpRegion">
+        <option value="all">everything — pose and expression</option>
+        <option value="exp">expression only — head holds still</option>
+        <option value="pose">pose only — face holds still</option>
+        <option value="lip">mouth only</option>
+        <option value="eyes">eyes only</option>
+      </select>
+    </label>
+    <label>Motion strength
+      <input type="range" id="lpMultiplier" min="0" max="2.5" step="0.05" value="1">
+      <span id="lpMultiplierVal" class="mono">1.00</span>
+    </label>
+    <label><input type="checkbox" id="lpRelativeMotion" title="Off copies the driver's absolute pose instead of the change since the reference frame"> Relative motion</label>
+    <label><input type="checkbox" id="lpEyeRetarget" title="Match the picture's eye opening to yours"> Eye retargeting</label>
+    <label><input type="checkbox" id="lpLipRetarget" title="Match the picture's mouth opening to yours"> Lip retargeting</label>
+    <label><input type="checkbox" id="lpPasteback" title="Off returns just the animated head crop instead of the whole picture"> Paste the head back into the picture</label>
+    <label><input type="checkbox" id="lpStitching" title="Blends the animated head into the picture; off is faster but shows a seam"> Stitching</label>
+    <label><input type="checkbox" id="lpNormalizeLip" title="Closes the mouth in the source picture before animating"> Normalise the source lips</label>
+    <hr>
+    <span class="hint"><b>Background</b> — restages the picture itself, so the swap keeps nothing of its window chrome, watermark or room.</span>
+    <label>Backdrop
+      <select id="bgMode">
+        <option value="keep">keep the picture as it is</option>
+        <option value="colour">solid colour</option>
+        <option value="image">my own image</option>
+      </select>
+    </label>
+    <label>Colour <input type="color" id="bgColour" value="#000000"></label>
+    <label>Background image <input type="file" id="bgFile" accept="image/*"></label>
+    <label><input type="checkbox" id="bgHeadCrop" title="Crop the picture to the head - hair included - before restaging"> Head only</label>
+    <span id="bgHint" class="hint"></span>
+    <button id="lpRecenter" title="Take the pose you are holding now as neutral">Re-zero pose</button>
+    <span class="hint">Paste-back, stitching and lip normalisation re-prepare every staged face — about a second.</span>
+  </div>
+</details>
+
 <details>
   <summary>Camera <em>— device, resolution, frame rate</em></summary>
   <div class="body">
@@ -202,6 +243,10 @@
     <label>Sharpness
       <input type="range" id="sharpness" min="0" max="1" step="0.05" value="0">
       <span id="sharpnessVal" class="mono">0.00</span>
+    </label>
+    <label title="Pull the swapped face's colour back towards your own complexion">Keep my skin tone
+      <input type="range" id="skinTone" min="0" max="1" step="0.05" value="0">
+      <span id="skinToneVal" class="mono">0.00</span>
     </label>
     <label><input type="checkbox" id="manyFaces"> All faces</label>
     <label><input type="checkbox" id="mouthMask" title="Keep the real mouth from your footage"> Keep real mouth</label>
@@ -484,11 +529,17 @@ function connect() {
             'paste, 960×540, uncheck "Shutdown source when not visible".';
         }
         fillModels(body.models, body.settings);
+        applyBackground(body.background, (body.settings || {}).matting);
         applySettings(body.settings);
         setStatus(`Connected (session ${sessionId}). Choose a source face…`, "ok");
         return;
       }
-      if (body.type === "settings") { applySettings(body.settings); return; }
+      if (body.type === "settings") {
+        applySettings(body.settings);
+        // A restage answers with both, so the backdrop controls settle too.
+        if (body.background) applyBackground(body.background, body.settings.matting);
+        return;
+      }
       if (body.type === "faces") {
         renderFaces(body.faces);
         if (body.message) setStatus(body.message, "ok");
@@ -598,6 +649,7 @@ function applySettings(st) {
     $("modeHint").textContent = "Portrait mode unavailable: " +
       (st.liveportrait.missing || []).join(", ");
   }
+  applyPortrait(st);
   $("brightness").value = st.brightness; $("brightnessVal").textContent = st.brightness;
   $("contrast").value = st.contrast; $("contrastVal").textContent = Number(st.contrast).toFixed(2);
   $("saturation").value = st.saturation; $("saturationVal").textContent = Number(st.saturation).toFixed(2);
@@ -606,8 +658,70 @@ function applySettings(st) {
   $("poissonBlend").checked = st.poisson_blend;
   $("enableInterpolation").checked = st.enable_interpolation;
   $("sharpness").value = st.sharpness; $("sharpnessVal").textContent = Number(st.sharpness).toFixed(2);
+  if (st.skin_tone !== undefined) {
+    $("skinTone").value = st.skin_tone;
+    $("skinToneVal").textContent = Number(st.skin_tone).toFixed(2);
+  }
   $("opacity").value = st.opacity;
   $("opacityVal").textContent = Number(st.opacity).toFixed(2);
+}
+
+// Portrait controls stay usable in swap mode rather than being hidden with the
+// mode they belong to: staging the look first and then switching is the normal
+// order, and a control that only exists after the switch cannot be set up.
+const LP_FLAGS = [
+  ["lpRelativeMotion", "flag_relative_motion"],
+  ["lpEyeRetarget", "flag_eye_retargeting"],
+  ["lpLipRetarget", "flag_lip_retargeting"],
+  ["lpPasteback", "flag_pasteback"],
+  ["lpStitching", "flag_stitching"],
+  ["lpNormalizeLip", "flag_normalize_lip"],
+];
+
+function applyPortrait(st) {
+  const p = st.portrait;
+  const usable = !st.liveportrait || st.liveportrait.available;
+  const row = $("portraitRow");
+  row.querySelectorAll("input, select, button").forEach((el) => { el.disabled = !usable; });
+  $("portraitHint").textContent = !usable
+    ? "Weights missing — these do nothing until Portrait mode is available."
+    : st.mode === "portrait"
+      ? "Applied to the next frame."
+      : "Set these now; they take effect when you switch to Portrait.";
+  if (!p) return;
+  $("lpRegion").value = p.animation_region;
+  $("lpMultiplier").value = p.driving_multiplier;
+  $("lpMultiplierVal").textContent = Number(p.driving_multiplier).toFixed(2);
+  LP_FLAGS.forEach(([id, key]) => { $(id).checked = !!p[key]; });
+  // Opened on the mode switch, not on load: it is a long section and most of a
+  // swap session never needs it.
+  if (st.mode === "portrait") row.open = true;
+}
+
+function applyBackground(bg, matting) {
+  if (bg) {
+    $("bgMode").value = bg.mode;
+    $("bgColour").value = bg.colour;
+    $("bgHeadCrop").checked = !!bg.head_crop;
+  }
+  const usable = !matting || matting.available;
+  ["bgMode", "bgColour", "bgFile", "bgHeadCrop"].forEach((id) => { $(id).disabled = !usable; });
+  $("bgHint").textContent = usable
+    ? "Applies to Portrait mode only — face swap takes nothing from the picture but the face."
+    : "Matting model missing, so the picture cannot be restaged.";
+}
+
+function sendBackground(patch) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    setStatus("Restaging the picture…");
+    ws.send(JSON.stringify(Object.assign({ type: "background" }, patch)));
+  } else {
+    setStatus("Connect first.", "err");
+  }
+}
+
+function sendPortrait(patch) {
+  sendConfig({ portrait: patch });
 }
 
 function sendConfig(patch) {
@@ -626,6 +740,39 @@ function sendConfig(patch) {
   });
 });
 
+$("lpRegion").addEventListener("change", (e) => sendPortrait({ animation_region: e.target.value }));
+$("lpMultiplier").addEventListener("input", (e) => {
+  $("lpMultiplierVal").textContent = Number(e.target.value).toFixed(2);
+});
+$("lpMultiplier").addEventListener("change", (e) =>
+  sendPortrait({ driving_multiplier: parseFloat(e.target.value) }));
+LP_FLAGS.forEach(([id, key]) => {
+  $(id).addEventListener("change", (e) => {
+    if (["flag_pasteback", "flag_stitching", "flag_normalize_lip"].includes(key)) {
+      setStatus("Re-preparing staged faces…");
+    }
+    sendPortrait({ [key]: e.target.checked });
+  });
+});
+$("bgMode").addEventListener("change", (e) => sendBackground({ mode: e.target.value }));
+$("bgColour").addEventListener("change", (e) =>
+  sendBackground({ colour: e.target.value, mode: "colour" }));
+$("bgHeadCrop").addEventListener("change", (e) => sendBackground({ head_crop: e.target.checked }));
+$("bgFile").addEventListener("change", async (e) => {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  // Same downscale as a source face: a phone photo is several MB and the
+  // backdrop only ever gets scaled to the picture's own size anyway.
+  const data = await toDataURL(file);
+  sendBackground({ image: data, mode: "image" });
+  e.target.value = "";
+});
+
+$("lpRecenter").addEventListener("click", () => {
+  sendConfig({ recenter: true });
+  setStatus("Neutral pose re-taken from your next frame.", "ok");
+});
+
 $("model").addEventListener("change", (e) => {
   setStatus(`Loading ${e.target.value}…`);
   sendConfig({ model: e.target.value });
@@ -636,6 +783,8 @@ $("poissonBlend").addEventListener("change", (e) => sendConfig({ poisson_blend: 
 $("enableInterpolation").addEventListener("change", (e) => sendConfig({ enable_interpolation: e.target.checked }));
 $("sharpness").addEventListener("input", (e) => { $("sharpnessVal").textContent = Number(e.target.value).toFixed(2); });
 $("sharpness").addEventListener("change", (e) => sendConfig({ sharpness: parseFloat(e.target.value) }));
+$("skinTone").addEventListener("input", (e) => { $("skinToneVal").textContent = Number(e.target.value).toFixed(2); });
+$("skinTone").addEventListener("change", (e) => sendConfig({ skin_tone: parseFloat(e.target.value) }));
 $("opacity").addEventListener("input", (e) => {
   $("opacityVal").textContent = Number(e.target.value).toFixed(2);
 });
