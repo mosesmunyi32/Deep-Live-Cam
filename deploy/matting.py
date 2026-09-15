@@ -54,10 +54,9 @@ class Matter:
             # picture, which is a one-off at upload, not per frame. Set
             # DLC_MATTING_DEVICE=cuda on a card with headroom.
             if os.environ.get("DLC_MATTING_DEVICE", "cpu").lower() == "cuda":
-                providers = [("CUDAExecutionProvider",
-                              {"cudnn_conv_algo_search": "HEURISTIC",
-                               "cudnn_conv_use_max_workspace": "0",
-                               "arena_extend_strategy": "kSameAsRequested"}),
+                from lp_engine import cuda_provider_options
+
+                providers = [("CUDAExecutionProvider", cuda_provider_options()),
                              "CPUExecutionProvider"]
             else:
                 providers = ["CPUExecutionProvider"]

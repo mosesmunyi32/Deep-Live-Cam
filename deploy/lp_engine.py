@@ -74,27 +74,62 @@ def missing_weights():
     return [f for f in REQUIRED if not os.path.exists(os.path.join(WEIGHTS_DIR, f))]
 
 
-# ORT's CUDA defaults are tuned for a card with room to spare: an EXHAUSTIVE
-# convolution search, max cuDNN workspace, and an arena that doubles on each
-# extension. Measured on a 4 GB T1000 that costs ~1.1 GB of pure headroom - the
-# pipeline loaded and then ran out of memory partway through the first frame.
-# With these it loads in 1.7 GB and peaks around 2.8 GB, which fits.
-CUDA_PROVIDER_OPTIONS = {
+# ORT's CUDA knobs, chosen for the card that is actually present.
+#
+# The frugal set exists for a 4 GB T1000: ORT's defaults - an EXHAUSTIVE
+# convolution search with max cuDNN workspace and an arena that doubles on each
+# extension - cost about 1.1 GB of headroom that card does not have, and the
+# pipeline ran out of memory partway through its first frame without them.
+#
+# They are the wrong answer on a big card, and quietly so. kSameAsRequested
+# makes the arena ask for exactly what each allocation needs rather than growing
+# in power-of-two blocks, so a few dozen frames of differently-sized transients
+# fragment the pool. On a 24 GB 4090 portrait mode died after thirty frames:
+#
+#   Non-zero status code returned while running Conv node
+#   Name:'/dense_motion_network/occlusion/Conv'
+#   Failed to allocate memory for requested buffer of size 605342720
+#
+# 577 MB, unplaceable, on a card with gigabytes free - fragmentation, not
+# exhaustion. So measure the card and only economise where economy is needed.
+# DLC_ORT_TUNING=frugal|default forces it either way.
+FRUGAL_OPTIONS = {
     "cudnn_conv_algo_search": "HEURISTIC",
     "cudnn_conv_use_max_workspace": "0",
     "arena_extend_strategy": "kSameAsRequested",
-    # TF32 is on by default in ORT, and on Ampere and later it silently routes
-    # fp32 convolutions through tensor cores at ~10 bits of mantissa. That is
-    # the one numerical difference between a card with tensor cores and one
-    # without, so it is the first thing to turn off when a model behaves
-    # differently on a bigger GPU than it does here. DLC_TF32=0 does that.
-    "use_tf32": os.environ.get("DLC_TF32", "1"),
 }
+SMALL_CARD_BYTES = 8 * 1024 ** 3
+
+
+def cuda_provider_options() -> dict:
+    """Provider options for this machine's GPU."""
+    tuning = os.environ.get("DLC_ORT_TUNING", "auto").lower()
+    if tuning == "auto":
+        try:
+            import torch
+
+            total = torch.cuda.get_device_properties(0).total_memory
+            tuning = "frugal" if total < SMALL_CARD_BYTES else "default"
+            _LOG.info("ORT tuning %s for a %.0f GB card", tuning, total / 1024 ** 3)
+        except Exception as exc:
+            # No torch, no CUDA, no answer - assume the small card, because
+            # being slow on a big one beats not running on a small one.
+            _LOG.debug("could not size the GPU (%s); assuming a small card", exc)
+            tuning = "frugal"
+    opts = {
+        # TF32 is on by default in ORT, and on Ampere and later it routes fp32
+        # convolutions through tensor cores at ~10 bits of mantissa. First thing
+        # to turn off when a model behaves differently on a bigger GPU.
+        "use_tf32": os.environ.get("DLC_TF32", "1"),
+    }
+    if tuning == "frugal":
+        opts.update(FRUGAL_OPTIONS)
+    return opts
 
 
 @contextlib.contextmanager
 def _frugal_sessions():
-    """Apply CUDA_PROVIDER_OPTIONS to every session the pipeline builds.
+    """Apply cuda_provider_options() to every session the pipeline builds.
 
     The vendored predictor hardcodes bare provider names, so the options are
     injected around construction instead of by editing it - keeping the vendored
@@ -111,7 +146,7 @@ def _frugal_sessions():
 
     def build(path, *args, **kwargs):
         kwargs.pop("provider_options", None)
-        kwargs["providers"] = [("CUDAExecutionProvider", CUDA_PROVIDER_OPTIONS),
+        kwargs["providers"] = [("CUDAExecutionProvider", cuda_provider_options()),
                                "CPUExecutionProvider"]
         return original(path, *args, **kwargs)
 
