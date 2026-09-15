@@ -247,6 +247,42 @@ Nothing under `modules/` is modified for this. The correction is inserted by
 wrapping the swapper model's own `get()`, which is where upstream hands back the
 swapped face and its affine.
 
+### Making the swap belong to the footage
+
+A swapped face reads as fake for a specific, measurable reason: it does not
+match the frame it is sitting in. `inswapper` returns a 128x128 patch that is
+smoother, sharper, cleaner and more evenly lit than the camera's own pixels
+around it. Everything else in frame - the hands, the background, the jewellery,
+the sensor noise, the lens distortion, the handheld jitter - is already real,
+because it came out of a real camera. It needs nothing done to it, and adding
+film grain or blur over the top only degrades genuine footage.
+
+So the **Realism** controls do not invent texture. Each pass measures the face
+being replaced and hands what it finds to the face replacing it, in the
+swapper's aligned space where the two correspond pixel for pixel:
+
+| Pass | What it takes from the real face |
+|---|---|
+| `detail` | High frequencies above ~1.6 px: pores, stubble, hair, and the camera's own noise |
+| `light` | Low-frequency luminance, so highlights and shadows fall where the room put them |
+| `softness` | The lens's focus, blurring the swap down to it — never sharpening up, which would invent detail |
+| `motion` | Frame-to-frame displacement by phase correlation, applied as a line kernel: the shutter's own smear |
+| `grain` | The gap between the plate's high-frequency energy and the swap's, as monochrome noise |
+| `fringe` | A sub-pixel radial channel offset — the colour fringing every lens has and no swap does |
+
+Measured on a swap against its own plate: skin texture 7.18 → 7.87 where the
+real face reads 8.18, and **2 ms per frame** for all six passes. Order matters
+and follows the light: texture, then lighting, then lens, then shutter, then
+sensor — so blur lands on detail rather than detail landing on blur.
+
+Two deliberate refusals. **Softness never sharpens**, because raising detail the
+camera did not record is the exact failure this exists to avoid. And **grain
+defaults to zero**, because `detail` already carries the plate's real noise
+across; adding more on top reads as dirt.
+
+*Match the camera* sets the preset. It applies to face swap only — portrait mode
+replaces the whole head, so there is no surrounding face to match against.
+
 ### Keeping the original face instead
 
 Two controls already do this, and they answer different questions:

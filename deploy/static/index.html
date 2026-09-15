@@ -265,6 +265,42 @@
   </div>
 </details>
 
+<details id="realismRow">
+  <summary>Realism <em>— match the swap to your camera</em></summary>
+  <div class="body">
+    <span class="hint">Nothing here invents texture. Each control measures the face being replaced and gives what it finds to the face replacing it.</span>
+    <div>
+      <button id="realismPreset">Match the camera</button>
+      <button id="realismOff">Off</button>
+    </div>
+    <label title="Pores, stubble and hair detail taken from your real face, which inswapper smooths away">Skin texture
+      <input type="range" id="rDetail" min="0" max="1" step="0.05" value="0">
+      <span id="rDetailVal" class="mono">0.00</span>
+    </label>
+    <label title="Puts the room's highlights and shadows back on the swapped face">Lighting match
+      <input type="range" id="rLight" min="0" max="1" step="0.05" value="0">
+      <span id="rLightVal" class="mono">0.00</span>
+    </label>
+    <label title="Softens the swap to your lens's focus - never sharpens, which would invent detail">Focus match
+      <input type="range" id="rSoftness" min="0" max="1" step="0.05" value="0">
+      <span id="rSoftnessVal" class="mono">0.00</span>
+    </label>
+    <label title="Blurs the swap the way your shutter blurs everything else when you move">Motion blur
+      <input type="range" id="rMotion" min="0" max="1" step="0.05" value="0">
+      <span id="rMotionVal" class="mono">0.00</span>
+    </label>
+    <label title="Tops up sensor noise to the level your camera is actually producing">Sensor noise
+      <input type="range" id="rGrain" min="0" max="1" step="0.05" value="0">
+      <span id="rGrainVal" class="mono">0.00</span>
+    </label>
+    <label title="The trace of colour fringing every real lens leaves and no swap has">Lens fringing
+      <input type="range" id="rFringe" min="0" max="1" step="0.05" value="0">
+      <span id="rFringeVal" class="mono">0.00</span>
+    </label>
+    <span class="hint">Costs about 2 ms a frame. Applies to face swap; portrait mode has no plate to match against.</span>
+  </div>
+</details>
+
 <details>
   <summary>Lighting <em>— server-side, works on any device</em></summary>
   <div class="body">
@@ -676,6 +712,7 @@ function applySettings(st) {
   $("poissonBlend").checked = st.poisson_blend;
   $("enableInterpolation").checked = st.enable_interpolation;
   $("sharpness").value = st.sharpness; $("sharpnessVal").textContent = Number(st.sharpness).toFixed(2);
+  applyRealism(st.realism);
   if (st.skin_tone !== undefined) {
     $("skinTone").value = st.skin_tone;
     $("skinToneVal").textContent = Number(st.skin_tone).toFixed(2);
@@ -738,6 +775,20 @@ function sendBackground(patch) {
   }
 }
 
+const REALISM = [
+  ["rDetail", "detail"], ["rLight", "light"], ["rSoftness", "softness"],
+  ["rMotion", "motion"], ["rGrain", "grain"], ["rFringe", "fringe"],
+];
+
+function applyRealism(r) {
+  if (!r) return;
+  REALISM.forEach(([id, key]) => {
+    const v = r[key] === undefined ? 0 : r[key];
+    $(id).value = v;
+    $(id + "Val").textContent = Number(v).toFixed(2);
+  });
+}
+
 function sendPortrait(patch) {
   sendConfig({ portrait: patch });
 }
@@ -757,6 +808,16 @@ function sendConfig(patch) {
     sendConfig({ mode: value });
   });
 });
+
+REALISM.forEach(([id, key]) => {
+  $(id).addEventListener("input", (e) => { $(id + "Val").textContent = Number(e.target.value).toFixed(2); });
+  $(id).addEventListener("change", (e) => sendConfig({ realism: { [key]: parseFloat(e.target.value) } }));
+});
+$("realismPreset").addEventListener("click", () => {
+  setStatus("Matching the swap to your camera…");
+  sendConfig({ realism: { preset: "camera" } });
+});
+$("realismOff").addEventListener("click", () => sendConfig({ realism: { preset: "off" } }));
 
 $("lpRegion").addEventListener("change", (e) => sendPortrait({ animation_region: e.target.value }));
 $("lpMultiplier").addEventListener("input", (e) => {

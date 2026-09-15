@@ -67,6 +67,7 @@ import modules.globals  # noqa: E402
 import modules.processors.frame.face_swapper as face_swapper  # noqa: E402
 from modules.face_analyser import get_one_face  # noqa: E402
 import matting  # noqa: E402
+import realism  # noqa: E402
 import skin_tone  # noqa: E402
 from lp_engine import ENGINE as LP  # noqa: E402
 
@@ -139,6 +140,10 @@ _mode = "swap"
 # Frames a client may keep in flight. One locally, where a round trip is
 # nothing; more when the GPU is a continent away. See LatestSlot.
 IN_FLIGHT = max(1, min(8, int(os.environ.get("DLC_IN_FLIGHT", "1"))))
+
+# How hard each realism pass matches the swapped face to the frame around it.
+# Process-wide, like the model and the mode, because the swapper is.
+_realism = dict(realism.DEFAULTS)
 
 
 def available_models():
@@ -215,7 +220,9 @@ def set_model(fname: str) -> str:
         # Additive, not a patch to modules/: the correction sits between the
         # swapper and upstream's caller, where the swapped face and the face it
         # replaces are still in the same aligned space.
-        skin_tone.wrap(model, lambda: float(getattr(modules.globals, "skin_tone", 0.0)))
+        skin_tone.wrap(model,
+                       lambda: float(getattr(modules.globals, "skin_tone", 0.0)),
+                       lambda: dict(_realism))
         face_swapper.FACE_SWAPPER = model
         del previous
 
@@ -299,6 +306,7 @@ def current_settings():
         "opacity": float(getattr(modules.globals, "opacity", 1.0)),
         "sharpness": float(getattr(modules.globals, "sharpness", 0.0)),
         "skin_tone": float(getattr(modules.globals, "skin_tone", 0.0)),
+        "realism": dict(_realism),
         "poisson_blend": bool(getattr(modules.globals, "poisson_blend", False)),
         "enable_interpolation": bool(getattr(modules.globals, "enable_interpolation", False)),
         "interpolation_weight": float(getattr(modules.globals, "interpolation_weight", 0.2)),
@@ -383,7 +391,8 @@ def process_jpeg(entry: dict, payload: bytes, first: bool = False) -> Optional[b
     # first goes through set_model.
     if face_swapper.FACE_SWAPPER is not None:
         skin_tone.wrap(face_swapper.FACE_SWAPPER,
-                       lambda: float(getattr(modules.globals, "skin_tone", 0.0)))
+                       lambda: float(getattr(modules.globals, "skin_tone", 0.0)),
+                       lambda: dict(_realism))
 
     if face_swapper.FACE_SWAPPER is None:
         # Portrait mode unloads it. Upstream's lazy loader would happily reload
@@ -775,6 +784,21 @@ async def apply_config(ws: web.WebSocketResponse, body: dict) -> None:
             for sess in _sessions.values():
                 sess.slot.set_depth(IN_FLIGHT)
             _LOG.info("frames in flight -> %d", IN_FLIGHT)
+        if "realism" in body:
+            updates = body["realism"]
+            if not isinstance(updates, dict):
+                raise ValueError("realism settings must be an object")
+            if updates.get("preset") == "camera":
+                _realism.update(realism.PRESET)
+            elif updates.get("preset") == "off":
+                _realism.update(realism.DEFAULTS)
+            for key, value in updates.items():
+                if key == "preset":
+                    continue
+                if key not in realism.DEFAULTS:
+                    raise ValueError(f"unknown realism pass {key!r}")
+                _realism[key] = max(0.0, min(1.0, float(value)))
+            _LOG.info("realism -> %s", {k: round(v, 2) for k, v in _realism.items()})
         if "many_faces" in body:
             modules.globals.many_faces = bool(body["many_faces"])
         # color_correction is deliberately absent: apply_color_transfer is

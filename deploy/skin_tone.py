@@ -20,6 +20,8 @@ blends with, so only pixels that actually get replaced are measured.
 import cv2
 import numpy as np
 
+import realism
+
 _MASK_CACHE = {}
 
 
@@ -78,7 +80,7 @@ def match(bgr_fake: np.ndarray, frame: np.ndarray, M: np.ndarray,
     return cv2.addWeighted(bgr_fake, 1.0 - strength, corrected, strength, 0)
 
 
-def wrap(model, strength_of):
+def wrap(model, strength_of, realism_of=lambda: None):
     """Put `match` between the swapper and its caller.
 
     The swapper model is upstream's, and so is the function that calls it;
@@ -101,10 +103,20 @@ def wrap(model, strength_of):
         if paste_back or not isinstance(out, tuple) or len(out) != 2:
             return out
         bgr_fake, M = out
+
         strength = strength_of()
-        if strength <= 0:
-            return out
-        return match(bgr_fake, frame, M, strength), M
+        if strength > 0:
+            bgr_fake = match(bgr_fake, frame, M, strength)
+
+        # The same warp gives realism its reference: the real face, in the
+        # swapped face's own frame, so the two can be compared pixel for pixel.
+        realism_settings = realism_of()
+        if realism_settings:
+            h, w = bgr_fake.shape[:2]
+            plate = cv2.warpAffine(frame, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
+            bgr_fake = realism.apply(bgr_fake, plate, realism_settings)
+
+        return bgr_fake, M
 
     model.get = get
     model._dlc_skin_tone_wrapped = True
