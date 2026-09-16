@@ -66,8 +66,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import modules.globals  # noqa: E402
 import modules.processors.frame.face_swapper as face_swapper  # noqa: E402
 from modules.face_analyser import get_one_face  # noqa: E402
+import hyperswap  # noqa: E402
 import matting  # noqa: E402
 import realism  # noqa: E402
+import restore  # noqa: E402
 import skin_tone  # noqa: E402
 from lp_engine import ENGINE as LP  # noqa: E402
 
@@ -126,6 +128,10 @@ _last_session_id: Optional[str] = None
 KNOWN_LABELS = {
     "inswapper_128.onnx": "inswapper 128 · fp32 (default)",
     "inswapper_128_fp16.onnx": "inswapper 128 · fp16 (slow without tensor cores)",
+    # Twice inswapper's resolution. Heavier, so better on a pod than a laptop.
+    "hyperswap_1a_256.onnx": "HyperSwap 1a · 256 px",
+    "hyperswap_1b_256.onnx": "HyperSwap 1b · 256 px",
+    "hyperswap_1c_256.onnx": "HyperSwap 1c · 256 px",
 }
 DEFAULT_MODEL = "inswapper_128.onnx"
 
@@ -144,6 +150,10 @@ IN_FLIGHT = max(1, min(8, int(os.environ.get("DLC_IN_FLIGHT", "1"))))
 # How hard each realism pass matches the swapped face to the frame around it.
 # Process-wide, like the model and the mode, because the swapper is.
 _realism = dict(realism.DEFAULTS)
+
+# Face restoration after the swap. "none" by default: it costs a second
+# detection plus a 256-512 px network per face, and taste varies.
+_restore = {"model": "none", "strength": 0.6}
 
 
 def available_models():
@@ -195,8 +205,14 @@ def set_model(fname: str) -> str:
 
         previous = face_swapper.FACE_SWAPPER
         try:
-            model = insightface.model_zoo.get_model(
-                path, providers=modules.globals.execution_providers)
+            if hyperswap.is_hyperswap(fname):
+                # Not an inswapper, so insightface cannot load it - but the
+                # adapter answers get() the same way, so everything after this
+                # line treats it identically.
+                model = hyperswap.HyperSwap(path, providers=modules.globals.execution_providers)
+            else:
+                model = insightface.model_zoo.get_model(
+                    path, providers=modules.globals.execution_providers)
         except Exception as exc:
             raise ValueError(f"{fname} failed to load: {exc}") from exc
 
@@ -307,6 +323,9 @@ def current_settings():
         "sharpness": float(getattr(modules.globals, "sharpness", 0.0)),
         "skin_tone": float(getattr(modules.globals, "skin_tone", 0.0)),
         "realism": dict(_realism),
+        "restore": dict(_restore,
+                        available=[{"id": k, "label": restore.MODELS[k]["label"]}
+                                   for k in restore.available()]),
         "poisson_blend": bool(getattr(modules.globals, "poisson_blend", False)),
         "enable_interpolation": bool(getattr(modules.globals, "enable_interpolation", False)),
         "interpolation_weight": float(getattr(modules.globals, "interpolation_weight", 0.2)),
@@ -400,7 +419,23 @@ def process_jpeg(entry: dict, payload: bytes, first: bool = False) -> Optional[b
         # which it now is, because LivePortrait needs torch - and fp16 measured
         # six times slower on this card. Reload what was actually selected.
         set_model(_current_model)
-    return encode(face_swapper.process_frame(entry["face"], frame))
+
+    restoring = _restore["model"] != "none" and _restore["strength"] > 0
+    # The swap can write into the frame it is given, and restoration needs the
+    # untouched original as its source of real texture - copy only when it will
+    # actually be used.
+    plate = frame.copy() if restoring else None
+    out = face_swapper.process_frame(entry["face"], frame)
+
+    if restoring and out is not None:
+        from modules.face_analyser import get_many_faces, get_one_face
+        faces = (get_many_faces(plate) if modules.globals.many_faces
+                 else [f for f in [get_one_face(plate)] if f is not None])
+        out = restore.RESTORER.apply(
+            out, plate, faces or [], _restore["model"], _restore["strength"],
+            detail=float(_realism.get("detail", 0.0)),
+            providers=modules.globals.execution_providers)
+    return encode(out)
 
 
 def is_nsfw(frame: np.ndarray) -> bool:
@@ -784,6 +819,17 @@ async def apply_config(ws: web.WebSocketResponse, body: dict) -> None:
             for sess in _sessions.values():
                 sess.slot.set_depth(IN_FLIGHT)
             _LOG.info("frames in flight -> %d", IN_FLIGHT)
+        if "restore" in body:
+            upd = body["restore"]
+            if not isinstance(upd, dict):
+                raise ValueError("restore settings must be an object")
+            if "model" in upd:
+                if upd["model"] != "none" and upd["model"] not in restore.available():
+                    raise ValueError(f"restore model {upd['model']!r} is not installed")
+                _restore["model"] = upd["model"]
+            if "strength" in upd:
+                _restore["strength"] = max(0.0, min(1.0, float(upd["strength"])))
+            _LOG.info("restore -> %s", _restore)
         if "realism" in body:
             updates = body["realism"]
             if not isinstance(updates, dict):
@@ -850,6 +896,7 @@ async def set_mode(ws: web.WebSocketResponse, mode: str) -> None:
     loop = asyncio.get_running_loop()
     if mode == "portrait":
         await loop.run_in_executor(EXECUTOR, unload_swapper)
+        await loop.run_in_executor(EXECUTOR, restore.RESTORER.unload)
     else:
         # Prepared sources hold device tensors of their own, so they are dropped
         # *before* the unload rather than after: a live reference at that moment

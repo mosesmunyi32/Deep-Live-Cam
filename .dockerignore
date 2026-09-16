@@ -12,3 +12,6 @@ models/*.pth
 
 # LivePortrait weights are baked by the Dockerfile, not shipped in the context
 models/liveportrait/
+
+# Restore models are downloaded by the Dockerfile too.
+models/restore/

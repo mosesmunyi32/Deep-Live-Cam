@@ -557,6 +557,59 @@ is seconds per frame against a ~33 ms budget. That gap is architectural, not a
 tuning problem. They are worth using for stills and offline video; they are not
 an option for live.
 
+## HyperSwap: the higher-resolution swapper
+
+`hyperswap_1a_256`, `1b` and `1c` are FaceFusion Labs' swappers at **256 px**,
+twice inswapper's 128. They appear in the model list alongside inswapper.
+
+They are not inswapper-architecture, so insightface cannot load them - but
+`deploy/hyperswap.py` presents them through inswapper's own
+`get(frame, target, source, paste_back=False)`. Everything downstream consumes
+that call, so paste-back, the mouth mask, seamless edges, skin tone and every
+Realism pass work unchanged, at twice the resolution. The contract, from
+FaceFusion's own source: the same `arcface_128` alignment inswapper uses, the
+target as RGB normalised to [-1, 1], and the **normalised** ArcFace embedding
+as the source - where inswapper instead multiplies the raw embedding by an
+`emap` matrix stored in its weights. Input names are checked on load, so a wrong
+file fails with a sentence rather than a shape error on the first frame.
+
+Measured on the same frame, against the real face's texture 8.54 / sharpness 639:
+
+| | texture | sharpness |
+|---|---|---|
+| inswapper 128 | 5.83 | 161 |
+| HyperSwap 1b | 6.50 | 243 |
+| HyperSwap 1b + GPEN-512 | 9.69 | 693 |
+
+At 256 px it costs roughly three to four times inswapper per face, so it
+belongs on a pod rather than a 4 GB laptop.
+
+## Face restore
+
+A second network after the swap, to rebuild detail a 128-256 px swap cannot
+carry. Chosen from a list, with a strength slider:
+
+| Model | Character |
+|---|---|
+| GPEN-BFR 256 | Fast, modest sharpening |
+| GPEN-BFR 512 | Natural - still reads as a photograph |
+| GFPGAN 1.4 | Strongest, and visibly painted: harder lines, heavier contrast, and a habit of "restoring" on-screen text or overlays near the face into coloured artefacts |
+
+All three are ONNX from FaceFusion's HuggingFace mirror, and live in
+`models/restore/` so they stay out of the swapper list. Two reasons not to use
+upstream's own restore paths: its GPEN download URL returns **404**, and its
+GFPGAN path needs `gfpgan`, `basicsr` and `facexlib`, which pin old torch.
+
+**Restoration smooths skin, which is the opposite of what the Realism texture
+pass does.** Left in that order, choosing a restorer would silently undo "Skin
+texture". So after restoring, the texture pass runs again on the restored crop,
+from the real face underneath. The table above shows the consequence: with both
+on, texture can *overshoot* the real face, so a restore strength around 0.4-0.5
+is usually more natural than the 0.6 default.
+
+It costs a second face detection plus the restorer per face, and is released
+along with the swapper when portrait mode takes the GPU.
+
 ## Adding models
 
 `GET /models` lists **every `.onnx` in `models/`**, so adding one is a file

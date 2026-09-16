@@ -246,6 +246,13 @@
     <label>Model
       <select id="model"><option value="fp32">loading…</option></select>
     </label>
+    <label title="A second network that rebuilds detail the swap lost. Costs a face detection plus the model, per face">Face restore
+      <select id="restoreModel"><option value="none">none</option></select>
+    </label>
+    <label title="How much of the restored face to use - lower keeps more of the raw swap">Restore strength
+      <input type="range" id="restoreStrength" min="0" max="1" step="0.05" value="0.6">
+      <span id="restoreStrengthVal" class="mono">0.60</span>
+    </label>
     <label>Opacity
       <input type="range" id="opacity" min="0" max="1" step="0.05" value="1">
       <span id="opacityVal" class="mono">1.00</span>
@@ -713,6 +720,7 @@ function applySettings(st) {
   $("enableInterpolation").checked = st.enable_interpolation;
   $("sharpness").value = st.sharpness; $("sharpnessVal").textContent = Number(st.sharpness).toFixed(2);
   applyRealism(st.realism);
+  applyRestore(st.restore);
   if (st.skin_tone !== undefined) {
     $("skinTone").value = st.skin_tone;
     $("skinToneVal").textContent = Number(st.skin_tone).toFixed(2);
@@ -789,6 +797,24 @@ function applyRealism(r) {
   });
 }
 
+function applyRestore(r) {
+  if (!r) return;
+  const sel = $("restoreModel");
+  const wanted = ["none"].concat((r.available || []).map((m) => m.id));
+  const have = Array.from(sel.options).map((o) => o.value);
+  if (wanted.join() !== have.join()) {
+    sel.innerHTML = '<option value="none">none</option>';
+    (r.available || []).forEach((m) => {
+      const o = document.createElement("option");
+      o.value = m.id; o.textContent = m.label;
+      sel.appendChild(o);
+    });
+  }
+  sel.value = r.model;
+  $("restoreStrength").value = r.strength;
+  $("restoreStrengthVal").textContent = Number(r.strength).toFixed(2);
+}
+
 function sendPortrait(patch) {
   sendConfig({ portrait: patch });
 }
@@ -813,6 +839,16 @@ REALISM.forEach(([id, key]) => {
   $(id).addEventListener("input", (e) => { $(id + "Val").textContent = Number(e.target.value).toFixed(2); });
   $(id).addEventListener("change", (e) => sendConfig({ realism: { [key]: parseFloat(e.target.value) } }));
 });
+$("restoreModel").addEventListener("change", (e) => {
+  if (e.target.value !== "none") setStatus(`Loading ${e.target.options[e.target.selectedIndex].text}…`);
+  sendConfig({ restore: { model: e.target.value } });
+});
+$("restoreStrength").addEventListener("input", (e) => {
+  $("restoreStrengthVal").textContent = Number(e.target.value).toFixed(2);
+});
+$("restoreStrength").addEventListener("change", (e) =>
+  sendConfig({ restore: { strength: parseFloat(e.target.value) } }));
+
 $("realismPreset").addEventListener("click", () => {
   setStatus("Matching the swap to your camera…");
   sendConfig({ realism: { preset: "camera" } });

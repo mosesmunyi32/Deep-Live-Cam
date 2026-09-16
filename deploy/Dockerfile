@@ -91,6 +91,24 @@ assert n, 'expected GridSample3D nodes - has the export changed?'; \
 onnx.save(version_converter.convert_version(m, 20), p); \
 print('rewrote', len(n), 'GridSample3D nodes to standard GridSample at opset 20')"
 
+# HyperSwap 1a/1b/1c: FaceFusion Labs' 256 px swappers, twice inswapper's
+# resolution. Served through an adapter with inswapper's get() interface, so
+# they appear in the model list and everything downstream works unchanged.
+RUN for f in hyperswap_1a_256 hyperswap_1b_256 hyperswap_1c_256; do \
+      curl -fsSL --retry 3 -o "/app/models/$f.onnx" \
+        "https://huggingface.co/facefusion/models-3.3.0/resolve/main/$f.onnx" || exit 1; \
+    done
+
+# Face restorers, as ONNX from FaceFusion's mirror. Kept in their own directory
+# so they do not appear in the swapper list, which offers every top-level .onnx.
+# Upstream's GPEN download URL returns 404, and its GFPGAN path needs gfpgan,
+# basicsr and facexlib, which pin old torch - these need neither.
+RUN mkdir -p /app/models/restore && \
+    for f in gpen_bfr_256 gpen_bfr_512 gfpgan_1.4; do \
+      curl -fsSL --retry 3 -o "/app/models/restore/$f.onnx" \
+        "https://huggingface.co/facefusion/models-3.0.0/resolve/main/$f.onnx" || exit 1; \
+    done
+
 # u2net_human_seg: the person-segmentation half of U^2-Net, used to lift a
 # staged portrait off its background so portrait mode does not inherit a
 # screenshot's window chrome. Run once per staged picture, never per frame.
@@ -143,7 +161,7 @@ print('mask template OK', m.shape)"
 # first frame at runtime, which is an expensive place to find out.
 RUN python -c "\
 import glob, onnxruntime as ort; \
-files = sorted(glob.glob('/app/models/liveportrait/*.onnx')); \
+files = sorted(glob.glob('/app/models/liveportrait/*.onnx') + glob.glob('/app/models/restore/*.onnx') + glob.glob('/app/models/hyperswap_*.onnx')); \
 assert files, 'no LivePortrait weights to check'; \
 [ort.InferenceSession(f, providers=['CPUExecutionProvider']) and \
  print('session OK:', f.rsplit('/', 1)[-1]) for f in files]"
