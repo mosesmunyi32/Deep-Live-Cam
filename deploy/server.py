@@ -66,6 +66,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import modules.globals  # noqa: E402
 import modules.processors.frame.face_swapper as face_swapper  # noqa: E402
 from modules.face_analyser import get_one_face  # noqa: E402
+import alphaface  # noqa: E402
 import hyperswap  # noqa: E402
 import matting  # noqa: E402
 import realism  # noqa: E402
@@ -132,6 +133,8 @@ KNOWN_LABELS = {
     "hyperswap_1a_256.onnx": "HyperSwap 1a · 256 px",
     "hyperswap_1b_256.onnx": "HyperSwap 1b · 256 px",
     "hyperswap_1c_256.onnx": "HyperSwap 1c · 256 px",
+    # Trained on large-pose faces; the one to try when heads turn. Non-commercial.
+    "alphaface_256.onnx": "AlphaFace · 256 px · head turns (experimental)",
 }
 DEFAULT_MODEL = "inswapper_128.onnx"
 
@@ -205,7 +208,9 @@ def set_model(fname: str) -> str:
 
         previous = face_swapper.FACE_SWAPPER
         try:
-            if hyperswap.is_hyperswap(fname):
+            if alphaface.is_alphaface(fname):
+                model = alphaface.AlphaFace(path, providers=modules.globals.execution_providers)
+            elif hyperswap.is_hyperswap(fname):
                 # Not an inswapper, so insightface cannot load it - but the
                 # adapter answers get() the same way, so everything after this
                 # line treats it identically.

@@ -584,6 +584,54 @@ Measured on the same frame, against the real face's texture 8.54 / sharpness 639
 At 256 px it costs roughly three to four times inswapper per face, so it
 belongs on a pod rather than a 4 GB laptop.
 
+## AlphaFace: the head-turn swapper (experimental)
+
+[AlphaFace](https://arxiv.org/abs/2601.16429) (Yu et al., January 2026) is the
+newest real-time swapper we found. It is trained on FFHQ plus **LPFF, Large-Pose
+Flickr Faces**, which is the whole reason to want it: extreme head turns are
+where inswapper and HyperSwap break. The paper reports 24 ms a face on an
+RTX 4090, the lowest pose and expression error of the methods it compared, and
+FID 2.71 against SimSwap's 7.48. It was never compared against inswapper or
+HyperSwap.
+
+Its weights are PyTorch, published on Google Drive. `deploy/alphaface_export.py`
+rebuilds the network and exports it to ONNX at build time, and refuses to ship
+unless every learned weight loads and the ONNX output matches PyTorch - measured
+at a maximum difference of **8.16e-05**. Two things are folded into the graph:
+
+- **The identity projection.** AlphaFace's identity path is `w600k_r50`, then a
+  linear layer loaded from `emp.npy`, then L2 normalisation - and `emp.npy` is
+  **byte-for-byte inswapper's `emap`**. insightface already computes that
+  embedding, so no second recognition network is loaded.
+- **Its framing.** Training crops are FFHQ-aligned, not arcface-aligned, so
+  `deploy/alphaface.py` aligns to FFHQ before calling it.
+
+On one mostly-frontal frame, against the real face:
+
+| | like source ↑ | still like you ↓ | texture | sharpness |
+|---|---|---|---|---|
+| inswapper 128 | 0.885 | 0.087 | 5.83 | 161 |
+| HyperSwap 1b | 0.825 | 0.160 | 6.50 | 243 |
+| AlphaFace, full paste | **0.893** | **-0.011** | 5.58 | 140 |
+| AlphaFace, tight mask | 0.668 | 0.203 | 5.99 | 184 |
+
+**Full paste gives the strongest likeness and leaves none of the original face**,
+but on that frame it drew a red band along the hairline and smeared a microphone
+below the chin: FFHQ framing is wider than the ellipse upstream pastes, so the
+network's weakest region got pasted too. A tight mask removes both and gives the
+likeness back - face shape carries identity, and a tight mask keeps the
+original's.
+
+So coverage is a setting, `DLC_ALPHAFACE_MASK=tight|medium|wide|full`, defaulting
+to `medium`. **That default is reasoned, not measured**: the sweep between the
+two ends ran out of memory on a 4 GB laptop and never finished. Tune it on a
+pod, and with turned heads - a frontal frame is not the case AlphaFace is for.
+
+Costs to know about: it is **138.6 M parameters**, ten times HyperSwap's CPU
+time on the same frame, so expect it to be the slowest swapper on a GPU as well.
+And the paper licenses it **CC BY-NC-SA 4.0** while the repository says MIT -
+treat it as non-commercial.
+
 ## Face restore
 
 A second network after the swap, to rebuild detail a 128-256 px swap cannot

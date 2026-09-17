@@ -109,6 +109,28 @@ RUN mkdir -p /app/models/restore && \
         "https://huggingface.co/facefusion/models-3.0.0/resolve/main/$f.onnx" || exit 1; \
     done
 
+# AlphaFace: rebuilt from its published PyTorch checkpoint and exported to ONNX,
+# so it runs on the same onnxruntime as every other swapper. Only the files the
+# export needs are copied in here, ahead of the full COPY below - otherwise
+# every code change would re-download a 1.9 GB checkpoint.
+#
+# The weights exist only on Google Drive, which rate-limits popular files. A
+# failed *download* skips AlphaFace and the build carries on - it simply does
+# not appear in the model list. A failed *export* still fails the build: that
+# means the weights do not match the network, and shipping it would produce a
+# model that returns plausible noise without ever raising.
+COPY deploy/alphaface_export.py /app/deploy/alphaface_export.py
+COPY deploy/alphaface_net /app/deploy/alphaface_net
+RUN if python -c "import gdown; gdown.download(id='18ZOQB3WmIFnMwi1GqBroFFEOuSNKWpZQ', output='/tmp/alphaface.pt', quiet=True)" \
+       && [ -s /tmp/alphaface.pt ]; then \
+      python /app/deploy/alphaface_export.py /tmp/alphaface.pt \
+          /app/deploy/alphaface_net/emp.npy /app/models/alphaface_256.onnx \
+      && rm -f /tmp/alphaface.pt; \
+    else \
+      echo "AlphaFace weights unavailable from Google Drive - building without it"; \
+      rm -f /tmp/alphaface.pt; \
+    fi
+
 # u2net_human_seg: the person-segmentation half of U^2-Net, used to lift a
 # staged portrait off its background so portrait mode does not inherit a
 # screenshot's window chrome. Run once per staged picture, never per frame.
@@ -161,7 +183,7 @@ print('mask template OK', m.shape)"
 # first frame at runtime, which is an expensive place to find out.
 RUN python -c "\
 import glob, onnxruntime as ort; \
-files = sorted(glob.glob('/app/models/liveportrait/*.onnx') + glob.glob('/app/models/restore/*.onnx') + glob.glob('/app/models/hyperswap_*.onnx')); \
+files = sorted(glob.glob('/app/models/liveportrait/*.onnx') + glob.glob('/app/models/restore/*.onnx') + glob.glob('/app/models/hyperswap_*.onnx') + glob.glob('/app/models/alphaface_*.onnx')); \
 assert files, 'no LivePortrait weights to check'; \
 [ort.InferenceSession(f, providers=['CPUExecutionProvider']) and \
  print('session OK:', f.rsplit('/', 1)[-1]) for f in files]"

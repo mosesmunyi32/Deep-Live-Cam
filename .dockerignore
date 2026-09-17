@@ -15,3 +15,6 @@ models/liveportrait/
 
 # Restore models are downloaded by the Dockerfile too.
 models/restore/
+
+# Scratch space for AlphaFace export experiments.
+.afwork/

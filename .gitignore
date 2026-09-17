@@ -39,3 +39,4 @@ deploy/certs/
 # the mask came out empty, and the failure surfaced on the pod as "no usable
 # face in this image" - a bad photo, apparently, on a machine with no shell.
 !deploy/liveportrait/assets/*.png
+.afwork/
